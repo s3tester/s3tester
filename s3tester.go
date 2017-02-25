@@ -30,18 +30,18 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-// This is displayed with help, bump when updating
-const VERSION = "1.0.0-open"
+// VERSION is displayed with help, bump when updating
+const VERSION = "1.0.1-open"
 
 // result holds the performance metrics for a single goroutine that are later aggregated.
 type result struct {
-	count               int
-	failcount           int
-	elapsed_sum         time.Duration
-	elapsed_sum_squared float64
-	min                 time.Duration
-	max                 time.Duration
-	data                []detail
+	count             int
+	failcount         int
+	elapsedSum        time.Duration
+	elapsedSumSquared float64
+	min               time.Duration
+	max               time.Duration
+	data              []detail
 }
 
 // detail holds metrics for individual S3 requests.
@@ -59,7 +59,7 @@ type stats struct {
 }
 
 // Retrieve S3 objects while overriding accept-encoding to prevent the server from using gzip
-func IdentityGetObject(c *s3.S3, input *s3.GetObjectInput) (output *s3.GetObjectOutput, err error) {
+func identityGetObject(c *s3.S3, input *s3.GetObjectInput) (output *s3.GetObjectOutput, err error) {
 	req, out := c.GetObjectRequest(input)
 	output = out
 	req.HTTPRequest.Header.Set("Accept-Encoding", "identity")
@@ -91,35 +91,34 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 
 	limiter := rate.NewLimiter(ratePerSecond, 1)
 
-	tlc := &tls.Config{
-		InsecureSkipVerify: true,
-	}
-	tr := &http.Transport{
-		TLSClientConfig:    tlc,
-		DisableCompression: true,
-		Dial: (&net.Dialer{
-			Timeout:   60 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).Dial,
-		TLSHandshakeTimeout: 60 * time.Second,
-	}
-	client := &http.Client{Transport: tr}
-	s3Config := aws.NewConfig().
-		WithRegion("us-east-1").
-		WithMaxRetries(0).
-		WithCredentials(creds).
-		WithEndpoint(endpoint).
-		WithHTTPClient(client).
-		WithDisableComputeChecksums(true).
-		WithS3ForcePathStyle(true)
-	s3Session, err := session.NewSession(s3Config)
-	if err != nil {
-		log.Fatal("Failed to create an S3 session", err)
-	}
-
 	runstart := time.Now()
 	for i := 0; i < concurrency; i++ {
-		go func(id int, s3Session *session.Session) {
+		go func(id int) {
+			tlc := &tls.Config{
+				InsecureSkipVerify: true,
+			}
+			tr := &http.Transport{
+				TLSClientConfig:    tlc,
+				DisableCompression: true,
+				Dial: (&net.Dialer{
+					Timeout:   60 * time.Second,
+					KeepAlive: 180 * time.Second,
+				}).Dial,
+				TLSHandshakeTimeout: 60 * time.Second,
+			}
+			client := &http.Client{Transport: tr}
+			s3Config := aws.NewConfig().
+				WithRegion("us-east-1").
+				WithMaxRetries(0).
+				WithCredentials(creds).
+				WithEndpoint(endpoint).
+				WithHTTPClient(client).
+				WithDisableComputeChecksums(true).
+				WithS3ForcePathStyle(true)
+			s3Session, err := session.NewSession(s3Config)
+			if err != nil {
+				log.Fatal("Failed to create an S3 session", err)
+			}
 
 			svc := s3.New(s3Session)
 
@@ -178,7 +177,7 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 						Range:  aws.String(objrange),
 					}
 					start = time.Now()
-					_, err = IdentityGetObject(svc, params)
+					_, err = identityGetObject(svc, params)
 
 				case optype == "head":
 					params := &s3.HeadObjectInput{
@@ -204,7 +203,7 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 						Range:  aws.String(objrange),
 					}
 					start = time.Now()
-					_, err = IdentityGetObject(svc, getParams)
+					_, err = identityGetObject(svc, getParams)
 
 				case optype == "putget":
 					cl := int64(osize)
@@ -223,7 +222,7 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 					start = time.Now()
 					_, err = svc.PutObject(putParams)
 					if err == nil {
-						_, err = IdentityGetObject(svc, getParams)
+						_, err = identityGetObject(svc, getParams)
 					}
 
 				case optype == "putget9010r":
@@ -245,7 +244,7 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 							Range:  aws.String(objrange),
 						}
 						if err == nil {
-							_, err = IdentityGetObject(svc, getParams)
+							_, err = identityGetObject(svc, getParams)
 						}
 					}
 				}
@@ -270,15 +269,15 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 					r.max = elapsed
 				}
 
-				r.elapsed_sum += elapsed
-				r.elapsed_sum_squared += elapsed.Seconds() * elapsed.Seconds()
+				r.elapsedSum += elapsed
+				r.elapsedSumSquared += elapsed.Seconds() * elapsed.Seconds()
 
 				if logging {
 					r.data = append(r.data, detail{start, elapsed})
 				}
 			}
 			c <- r
-		}(i, s3Session)
+		}(i)
 	}
 
 	// Aggregate results across all clients.
@@ -293,8 +292,8 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 		r := <-c
 		aggregateResults.count += r.count
 		aggregateResults.failcount += r.failcount
-		aggregateResults.elapsed_sum += r.elapsed_sum
-		aggregateResults.elapsed_sum_squared += r.elapsed_sum_squared
+		aggregateResults.elapsedSum += r.elapsedSum
+		aggregateResults.elapsedSumSquared += r.elapsedSumSquared
 
 		if r.min < aggregateResults.min {
 			aggregateResults.min = r.min
@@ -318,9 +317,9 @@ func runtest(concurrency int, nrequests int, osize int, endpoint string, optype 
 func calcStats(results result, concurrency int, runtime time.Duration) stats {
 	var runStats stats
 
-	runStats.mean = results.elapsed_sum / time.Duration(results.count)
+	runStats.mean = results.elapsedSum / time.Duration(results.count)
 
-	stddev := math.Sqrt(results.elapsed_sum_squared/float64(results.count) - runStats.mean.Seconds()*runStats.mean.Seconds())
+	stddev := math.Sqrt(results.elapsedSumSquared/float64(results.count) - runStats.mean.Seconds()*runStats.mean.Seconds())
 	runStats.stddev = time.Duration(int64(stddev * 1000000000))
 
 	runStats.nominalThrougput = 1.0 / runStats.mean.Seconds() * float64(concurrency)
