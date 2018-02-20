@@ -16,34 +16,57 @@ s3tester retrieves the access key and the secret access key from the environment
     $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 
 ## Command line options
-    ./s3tester --help
-    Usage of ./s3tester:
-    -bucket string
-          bucket name (needs to exist) (default "test")
-    -concurrency int
-          Maximum concurrent requests (0=scan concurrency, run with ulimit -n 16384) (default 1)
-    -cpuprofile string
-          write cpu profile to file
-    -endpoint string
-          target endpoint (default "https://127.0.0.1:18082")
-    -logdetail string
-          write detailed log to file
-    -operation string
-          operation type: put, get, randget, putget, putget9010r, head, delete or options (default "put")
-    -overwrite
-          Turns a PUT into an overwrite of the same s3 key.
-    -prefix string
-          object name prefix (default "testobject")
-    -range string
-          Specify range header for GET requests
-    -ratelimit float
-          the total number of operations per second across all threads (default 1.7976931348623157e+308)
-    -requests int
-          Total number of requests (default 1000)
-    -rr
-        Reduced redundancy storage for PUT requests
-    -size int
-          Object size (default 30720)
+
+	./s3tester --help
+	Usage of ./s3tester:
+  	-bucket string
+        	bucket name (needs to exist) (default "test")
+  	-concurrency int
+        	Maximum concurrent requests (0=scan concurrency, run with ulimit -n 16384) (default 1)
+  	-cpuprofile string
+        	write cpu profile to file
+  	-duration value
+        	Test duration in seconds
+  	-endpoint string
+        	target endpoint (default "https://127.0.0.1:18082")
+  	-lockstep
+        	Force all threads to advance at the same rate rather than run independently
+  	-logdetail string
+        	write detailed log to file
+  	-metadata string
+        	The metadata to use for the objects. The string must be formatted as such: 'key1=value1&key2=value2'. Used for put, updatemeta, multipartput, putget and putget9010r.
+  	-operation string
+        	operation type: put, multipartput, get, puttagging, updatemeta, validate, randget, delete, options, head, putget, putget9010r (default "put")
+  	-overwrite int
+        	Turns a PUT/GET/HEAD into an operation on the same s3 key. (1=all writes/reads are to same object, 2=threads clobber each other but each write/read is to unique objects).
+  	-partsize int
+        	Size of each part (min 5MiB); only has an effect when a multipart put is used (default 5242880)
+  	-prefix string
+        	object name prefix (default "testobject")
+  	-range string
+        	Specify range header for GET requests
+  	-ratelimit float
+        	the total number of operations per second across all threads (default 1.7976931348623157e+308)
+  	-region string
+        	Region to send requests to (default "us-east-1")
+  	-repeat int
+        	Repeat each S3 operation this many times (default 1)
+  	-requests value
+        	Total number of requests (default 1000)
+  	-retries int
+        	Number of retry attempts. Default is 0.
+  	-retrysleep int
+        	How long to sleep in between each retry in milliseconds. Default (0) is to use the default retry method which is an exponential backoff.
+  	-rr
+        	Reduced redundancy storage for PUT requests
+  	-size int
+        	Object size. Note that s3tester is not ideal for very large objects as the entire body must be read for v4 signing and the aws sdk does not support v4 chunked. Performance may degrade as size increases due to the use of v4 signing without chunked support (default 30720)
+  	-tagging string
+        	The tag-set for the object. The tag-set must be formatted as such: 'tag1=value1&tage2=value2'. Used for put, puttagging, putget and putget9010r.
+ 	-verbosevalidate
+        	When true, return results for all objects from validate operation. When false, only for failures and hides performance results (default true)
+  	-verify
+        	Verify the retrieved data on a get operation - this is different from the validate operation
 
 ## Exit code
 `1` One or more requests has failed.
