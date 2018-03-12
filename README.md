@@ -2,9 +2,16 @@
 
 s3tester is a lightweight S3 API performance test command-line utility.
 
+## s3tester latest version
+
+	 1.1.4
+
 # Installation
 
      $ go get github.com/NetApp-StorageGRID/s3tester
+## Minimum Requirements
+	
+	 Go 1.7 or higher
 
 # Usage
 
