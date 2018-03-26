@@ -490,7 +490,12 @@ func runtest(args parameters) (float64, bool) {
 						_, err = svc.DeleteObject(params)
 
 					case args.optype == "randget":
-						objnum := rand.Intn(int(runNum))
+						var objnum int
+						if runNum <= 0 {
+							objnum = 0
+						} else {
+							objnum = rand.Intn(int(runNum))
+						}
 						getParams := &s3.GetObjectInput{
 							Bucket: aws.String(args.bucketname),
 							Key:    aws.String(args.objectprefix + "-" + strconv.Itoa(id) + "-" + strconv.Itoa(objnum)),
