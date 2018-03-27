@@ -31,7 +31,7 @@ import (
 )
 
 // VERSION is displayed with help, bump when updating
-const VERSION = "1.1.4"
+const VERSION = "1.1.5"
 
 // result holds the performance metrics for a single goroutine that are later aggregated.
 type result struct {
