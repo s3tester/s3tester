@@ -264,6 +264,7 @@ func runtest(args parameters) (float64, bool) {
 			}
 
 			for j := 0; uint64(j) <= runNum; j++ {
+				obj.Offset = 0
 				limiter.Wait(context.Background())
 
 				var start time.Time
@@ -772,6 +773,14 @@ func main() {
 
 	if !opTypeExists {
 		log.Fatal("operation type must be one of: " + operationListString)
+	}
+
+	if nrequests.set && nrequests.value <= 0 {
+		return parameters{}, errors.New("Number of requests must be > 0")
+	}
+
+	if *concurrency <= 0 {
+		return parameters{}, errors.New("Concurrency must be > 0")
 	}
 
 	if duration.set && nrequests.set {
