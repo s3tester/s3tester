@@ -31,7 +31,7 @@ import (
 )
 
 // VERSION is displayed with help, bump when updating
-const VERSION = "1.1.5"
+const VERSION = "1.1.6"
 
 // result holds the performance metrics for a single goroutine that are later aggregated.
 type result struct {
@@ -776,11 +776,11 @@ func main() {
 	}
 
 	if nrequests.set && nrequests.value <= 0 {
-		return parameters{}, errors.New("Number of requests must be > 0")
+		log.Fatal("Number of requests must be > 0")
 	}
 
 	if *concurrency <= 0 {
-		return parameters{}, errors.New("Concurrency must be > 0")
+		log.Fatal("Concurrency must be > 0")
 	}
 
 	if duration.set && nrequests.set {

@@ -4,7 +4,7 @@ s3tester is a lightweight S3 API performance test command-line utility.
 
 ## s3tester latest version
 
-	 1.1.5
+	 1.1.6
 
 # Installation
 
