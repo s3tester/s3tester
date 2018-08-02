@@ -1,6 +1,9 @@
-# About
+# COSBench2 - A highly performant Cloud Object Storage Benchmark Tool
 
-s3tester is a lightweight S3 API performance test command-line utility.
+
+COSBench2 is a lightweight S3 API performance test command-line utility. Focussed on high performance.
+This tool is in active development - please submit feature requests in the issues page
+
 
 ## s3tester latest version
 
