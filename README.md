@@ -1,4 +1,4 @@
-# COSBench2 - A highly performant Cloud Object Storage Benchmark Tool
+# COSBench2 - Cloud Object Storage Benchmark Tool - 2
 
 
 COSBench2 is a lightweight S3 API performance test command-line utility. Focussed on high performance.
