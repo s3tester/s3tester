@@ -83,7 +83,7 @@ cosbench2 retrieves the access key and the secret access key from the environmen
 
 ## Writing objects into a bucket
 
-    ./s3tester -concurrency=128 -size=20000000 -operation=put -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
+    ./cosbench2 -concurrency=128 -size=20000000 -operation=put -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
 
 - Starts writing objects into the default bucket "test".
 - The bucket needs to be created prior to running s3tester.
@@ -93,7 +93,7 @@ cosbench2 retrieves the access key and the secret access key from the environmen
 - Replace the sample IP/port combination with the one you are using.
 
 ## Reading objects from a bucket (and other operations)
-    ./s3tester -concurrency=128 -operation=get -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
+    ./cosbench2 -concurrency=128 -operation=get -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
 
 - Matches the request above and will read the same objects written in the same sequence.
 - If you use the `randget` operation the objects will be read in random order simulating a random-access workload.
