@@ -1,4 +1,4 @@
-# COSBench2
+# COSBench2 - S3 Performance Benchmarking 
 
 
 COSBench2 is a lightweight high performance, S3 API performance test command-line utility. 
