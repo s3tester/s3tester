@@ -5,7 +5,7 @@ COSBench2 is a lightweight high performance, S3 API performance test command-lin
 This tool is in active development - please submit feature requests in the issues page
 
 
-## s3tester latest version
+## cosbench2 latest version
 
 	 1.1.6
 
@@ -20,15 +20,15 @@ This tool is in active development - please submit feature requests in the issue
 
 ## Setting your s3 credentials
 
-s3tester retrieves the access key and the secret access key from the environment variables as shown below:
+cosbench2 retrieves the access key and the secret access key from the environment variables as shown below:
 
     $ export AWS_ACCESS_KEY=AKIAINZFCN46TISVUUCA
     $ export AWS_SECRET_ACCESS_KEY=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
 
 ## Command line options
 
-	./s3tester --help
-	Usage of ./s3tester:
+	./cosbench2 --help
+	Usage of ./cosbench2:
   	-bucket string
         	bucket name (needs to exist) (default "test")
   	-concurrency int
