@@ -1,7 +1,7 @@
 # COSBench2 - S3 Performance Benchmarking 
 
 
-COSBench2 is a lightweight high performance, S3 API performance test command-line utility. 
+COSBench2 is a lightweight high performance, S3 performance testing utility. 
 
 Because COSBench2 is focussed on S3, it is more performant and accurate for S3 storage benchmarking.
 If you want to compare S3 with other object protocols - consider the older Cosbench (See https://github.com/intel-cloud/cosbench/)
