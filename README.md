@@ -11,7 +11,7 @@ This tool is in active development - please submit feature requests in the issue
 
 # Installation
 
-     $ go get github.com/NetApp-StorageGRID/s3tester
+     $ go get github.com/cosbench2/cosbench2.git
 ## Minimum Requirements
 	
 	 Go 1.7 or higher
