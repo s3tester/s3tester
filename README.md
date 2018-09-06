@@ -14,7 +14,7 @@ This tool is in active development - please submit feature requests in the issue
 
 # Installation
 
-     $ go get github.com/cosbench2/cosbench2.git
+     $ go get github.com/s3tester/s3tester.git
 ## Minimum Requirements
 	
 	 Go 1.7 or higher
@@ -23,15 +23,15 @@ This tool is in active development - please submit feature requests in the issue
 
 ## Setting your s3 credentials
 
-cosbench2 retrieves the access key and the secret access key from the environment variables as shown below:
+s3tester retrieves the access key and the secret access key from the environment variables as shown below:
 
     $ export AWS_ACCESS_KEY=AKIAINZFCN46TISVUUCA
     $ export AWS_SECRET_ACCESS_KEY=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
 
 ## Command line options
 
-	./cosbench2 --help
-	Usage of ./cosbench2:
+	./s3tester --help
+	Usage of ./s3tester:
   	-bucket string
         	bucket name (needs to exist) (default "test")
   	-concurrency int
@@ -86,7 +86,7 @@ cosbench2 retrieves the access key and the secret access key from the environmen
 
 ## Writing objects into a bucket
 
-    ./cosbench2 -concurrency=128 -size=20000000 -operation=put -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
+    ./s3tester -concurrency=128 -size=20000000 -operation=put -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
 
 - Starts writing objects into the default bucket "test".
 - The bucket needs to be created prior to running s3tester.
@@ -96,7 +96,7 @@ cosbench2 retrieves the access key and the secret access key from the environmen
 - Replace the sample IP/port combination with the one you are using.
 
 ## Reading objects from a bucket (and other operations)
-    ./cosbench2 -concurrency=128 -operation=get -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
+    ./s3tester -concurrency=128 -operation=get -requests=200000 -endpoint="10.96.105.5:8082" -prefix=3
 
 - Matches the request above and will read the same objects written in the same sequence.
 - If you use the `randget` operation the objects will be read in random order simulating a random-access workload.
