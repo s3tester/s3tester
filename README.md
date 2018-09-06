@@ -1,15 +1,14 @@
-# COSBench2 - S3 Performance Benchmarking 
+# s3tester - S3 Performance Benchmarking 
 
 
-COSBench2 is a lightweight high performance, S3 performance testing utility. 
+s3tester is a lightweight high performance, S3 performance testing utility. 
 
-Because COSBench2 is focussed on S3, it is more performant and accurate for S3 storage benchmarking.
-If you want to compare S3 with other object protocols - consider the older Cosbench (See https://github.com/intel-cloud/cosbench/)
+Because s3tester is focussed on S3, it is more performant and accurate for S3 storage benchmarking.
 
 This tool is in active development - please submit feature requests in the issues page
 
 
-## cosbench2 latest version
+## s3tester latest version
 
 	 1.1.6
 
