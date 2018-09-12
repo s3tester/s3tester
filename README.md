@@ -14,7 +14,7 @@ This tool is in active development - please submit feature requests in the issue
 
 # Installation
 
-     $ go get github.com/s3tester/s3tester.git
+     $ go get github.com/s3tester/s3tester
 ## Minimum Requirements
 	
 	 Go 1.7 or higher
