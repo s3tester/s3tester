@@ -30,8 +30,12 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-// VERSION is displayed with help, bump when updating
-const VERSION = "1.1.6"
+const (
+	// VERSION is displayed with help, bump when updating
+	VERSION = "1.1.7"
+	// for identifying s3tester requests in the user-agent header
+	userAgentString = "s3tester/"
+)
 
 // result holds the performance metrics for a single goroutine that are later aggregated.
 type result struct {
@@ -248,6 +252,11 @@ func runtest(args parameters) (float64, bool) {
 			}
 
 			svc := s3.New(s3Session)
+
+			svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
+				userAgent := userAgentString + r.HTTPRequest.UserAgent()
+				r.HTTPRequest.Header.Set("User-Agent", userAgent)
+			})
 
 			var r = result{0, 0, 0, 0, 0, 0, 0, 0, []detail{}}
 
