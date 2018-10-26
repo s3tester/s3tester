@@ -10,7 +10,7 @@ This tool is in active development - please submit feature requests in the issue
 
 ## s3tester latest version
 
-	 1.1.6
+	 1.1.7
 
 # Installation
 
