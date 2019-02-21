@@ -2,11 +2,8 @@ package main
 
 import (
 	"crypto/tls"
-	"errors"
-	"flag"
+	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -16,10 +13,11 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/golang/time/rate"
 	"golang.org/x/net/context"
+	"golang.org/x/time/rate"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -28,26 +26,66 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/codahale/hdrhistogram"
 )
 
 const (
 	// VERSION is displayed with help, bump when updating
-	VERSION = "1.1.7"
+	VERSION = "2.1.0"
 	// for identifying s3tester requests in the user-agent header
 	userAgentString = "s3tester/"
 )
 
+type results struct {
+	CummulativeResult result    `json:"cummulativeResult"`
+	PerEndpointResult []*result `json:"endpointResult,omitempty"`
+}
+
 // result holds the performance metrics for a single goroutine that are later aggregated.
 type result struct {
-	uniqObjNum        int
-	count             int
-	failcount         int
-	sumObjSize        int64
-	elapsedSum        time.Duration
-	elapsedSumSquared float64
-	min               time.Duration
-	max               time.Duration
-	data              []detail
+	Category   string `json:"category,omitempty"`
+	UniqueName string `json:"uniqueName,omitempty"`
+
+	Endpoint    string `json:"endpoint,omitempty"`
+	Operation   string `json:"operation,omitempty"`
+	Concurrency int    `json:"concurrency,omitempty"`
+	UniqObjNum  int    `json:"totalUniqueObjects"`
+	Count       int    `json:"totalRequests"`
+	Failcount   int    `json:"failedRequests"`
+
+	TotalElapsedTime   float64 `json:"totalElapsedTime (ms)"`
+	AverageRequestTime float64 `json:"averageRequestTime (ms)"`
+	MinimumRequestTime float64 `json:"minimumRequestTime (ms)"`
+	MaximumRequestTime float64 `json:"maximumRequestTime (ms)"`
+
+	NominalRequestsPerSec float64 `json:"nominalRequestsPerSec"`
+	ActualRequestsPerSec  float64 `json:"actualRequestsPerSec"`
+	ContentThroughput     float64 `json:"contentThroughput (MB/s)"`
+	AverageObjectSize     float64 `json:"averageObjectSize"`
+
+	Percentiles map[string]float64 `json:"responseTimePercentiles(ms)"`
+
+	sumObjSize  int64
+	elapsedSum  time.Duration
+	data        []detail
+	latencies   *hdrhistogram.Histogram
+	startTime   time.Time
+	elapsedTime time.Duration
+}
+
+func NewResult() result {
+	// Tracking values between 1 hundredth of a millisecond up to (10 hours in hundredths of milliseconds) to 4 significant digits.
+	// At the maximum value of 10 hours the resolution will be 3.6 seconds or better.
+	var tensOfMicrosecondsPerSecond int64 = 1e5
+
+	// An hdrhistogram has a fixed sized based on its precision and value range. This configuration uses 2.375 MiB per client (concurrency parameter).
+	h := hdrhistogram.New(1, 10*3600*tensOfMicrosecondsPerSecond, 4)
+	return result{latencies: h}
+}
+
+func (this *result) RecordLatency(l time.Duration) {
+	// Record latency as hundredths of milliseconds.
+	this.latencies.RecordValue(l.Nanoseconds() / 1e4)
 }
 
 // detail holds metrics for individual S3 requests.
@@ -56,716 +94,476 @@ type detail struct {
 	elapsed time.Duration
 }
 
-// stats hold aggregate statistics
-// nominalThroughput and actualThroughput measure the throughput with units of #requests/s
-// bodyThrougput measures the throughput with units of MB/s
-type stats struct {
-	mean             time.Duration
-	stddev           time.Duration
-	nominalThrougput float64
-	actualThrougput  float64
-	bodyThrougput    float64
-}
-
-// intFlag is used to differentiate user-defined value from default value
-type intFlag struct {
-	set   bool
-	value int
-}
-
-type parameters struct {
-	concurrency       int
-	osize             int64
-	endpoint          string
-	optype            string
-	bucketname        string
-	objectprefix      string
-	tagging           string
-	metadata          string
-	ratePerSecond     rate.Limit
-	logging           bool
-	objrange          string
-	reducedRedundancy bool
-	overwrite         int
-	retries           int
-	retrySleep        int
-	lockstep          bool
-	repeat            int
-	region            string
-	partsize          int64
-	verify            bool
-	nrequests         *intFlag
-	duration          *intFlag
+func IsErrorRetryable(err error) bool {
+	if err != nil {
+		if err, ok := err.(awserr.Error); ok {
+			// inconsistency can lead to a multipart complete not seeing a part just uploaded.
+			return err.Code() == "InvalidPart"
+		}
+	}
+	return false
 }
 
 type CustomRetryer struct {
-	maxRetries         int
-	retrySleepPeriodMs int
-	defaultRetryer     request.Retryer
-}
-
-func (d CustomRetryer) RetryRules(r *request.Request) time.Duration {
-	return time.Millisecond * time.Duration(d.retrySleepPeriodMs)
+	maxRetries     int
+	defaultRetryer request.Retryer
 }
 
 func (d CustomRetryer) ShouldRetry(r *request.Request) bool {
+	if IsErrorRetryable(r.Error) {
+		return true
+	}
 	return d.defaultRetryer.ShouldRetry(r)
+}
+
+func (d CustomRetryer) RetryRules(r *request.Request) time.Duration {
+	return d.defaultRetryer.RetryRules(r)
 }
 
 func (d CustomRetryer) MaxRetries() int {
 	return d.maxRetries
 }
 
-func parseMetadataString(metaString string) map[string]*string {
-	meta := make(map[string]*string)
-	if metaString != "" {
-		// metadata is supplied like so: key1=value2&key2=value2&...
-		pairs := strings.Split(metaString, "&")
-		for index := range pairs {
-			keyvalue := strings.Split(pairs[index], "=")
-			if len(keyvalue) != 2 {
-				log.Fatal("Invalid metadata string supplied. Must be formatted like: 'key1=value1&key2=value2...'")
-			}
-			meta[keyvalue[0]] = &keyvalue[1]
-		}
+func NewCustomRetryer(retries int) *CustomRetryer {
+	return &CustomRetryer{maxRetries: retries, defaultRetryer: client.DefaultRetryer{NumMaxRetries: retries}}
+}
+
+type RetryerWithSleep struct {
+	base               *CustomRetryer
+	retrySleepPeriodMs int
+}
+
+func (d RetryerWithSleep) RetryRules(r *request.Request) time.Duration {
+	return time.Millisecond * time.Duration(d.retrySleepPeriodMs)
+}
+
+func (d RetryerWithSleep) ShouldRetry(r *request.Request) bool {
+	return d.base.ShouldRetry(r)
+}
+
+func (d RetryerWithSleep) MaxRetries() int {
+	return d.base.MaxRetries()
+}
+
+func NewRetryerWithSleep(retries int, sleepPeriodMs int) *RetryerWithSleep {
+	return &RetryerWithSleep{retrySleepPeriodMs: sleepPeriodMs, base: NewCustomRetryer(retries)}
+}
+
+func randMinMax(source *rand.Rand, min int64, max int64) int64 {
+	return min + source.Int63n(max-min+1)
+}
+
+type durationSetting struct {
+	applicable bool
+	runstart   time.Time
+	maxRunTime time.Duration
+}
+
+func NewDurationSetting(duration *intFlag, runStart time.Time) *durationSetting {
+	if duration.set {
+		maxRunTime := time.Duration(duration.value * 1e9)
+		return &durationSetting{applicable: true, runstart: runStart, maxRunTime: maxRunTime}
+	} else {
+		return &durationSetting{applicable: false}
 	}
-	return meta
 }
 
-func (intf *intFlag) Set(content string) error {
-	val, err := strconv.Atoi(content)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(2)
+func (ds *durationSetting) enabled() bool {
+	if ds.applicable {
+		return time.Since(ds.runstart) >= ds.maxRunTime
 	}
-	intf.value = val
-	intf.set = true
-	return nil
-}
-
-func (intf *intFlag) String() string {
-	return strconv.Itoa(intf.value)
-}
-
-func NewintFlag(content int) intFlag {
-	intf := intFlag{}
-	intf.value = content
-	intf.set = false
-	return intf
-}
-
-// Retrieves objects from Amazon S3.
-func identityGetObject(c *s3.S3, input *s3.GetObjectInput, verify bool) (output *s3.GetObjectOutput, err error) {
-	req, out := c.GetObjectRequest(input)
-	output = out
-	req.HTTPRequest.Header.Set("Accept-Encoding", "identity")
-	err = req.Send()
-	if err == nil && req.HTTPResponse.Body != nil {
-		if !verify {
-			io.Copy(ioutil.Discard, req.HTTPResponse.Body)
-		} else {
-			key := []byte(*input.Key)
-			buffer := make([]byte, 1024)
-			index := 0
-			var read int
-			var readError error = nil
-			// keep reading until we reach EOF (or some other error)
-		loop:
-			for readError == nil {
-				read, readError = req.HTTPResponse.Body.Read(buffer)
-				for i := 0; i < read; i++ {
-					if buffer[i] != key[index%len(key)] {
-						readError = errors.New("Retrieved data different from expected")
-						break loop
-					}
-					index++
-				}
-			}
-
-			if readError != io.EOF {
-				err = readError
-			}
-		}
-		req.HTTPResponse.Body.Close()
-	}
-	return
+	return false
 }
 
 var detailed []detail
 
-func runtest(args parameters) (float64, bool) {
+func runtest(args parameters) (float64, results) {
 	c := make(chan result, args.concurrency)
-	creds := credentials.NewEnvCredentials()
+	startTime := time.Now()
+	startTestWorker(c, args)
+	testResult := collectWorkerResult(c, args, startTime)
 
-	sc := s3.StorageClassStandard
-	if args.reducedRedundancy {
-		sc = s3.StorageClassReducedRedundancy
+	if args.optype != "validate" {
+		processTestResult(&testResult, args)
+		printTestResult(&testResult, args.isJson)
 	}
+	return float64(testResult.CummulativeResult.Count) / testResult.CummulativeResult.elapsedTime.Seconds(), testResult
+}
 
+func startTestWorker(c chan<- result, args parameters) {
+	credential, err := loadCredentialProfile(args.profile, args.nosign)
+	if err != nil {
+		fmt.Println("Failed loading credentials.\nPlease specify env variable AWS_SHARED_CREDENTIALS_FILE if you put credential file other than AWS CLI configuration directory.")
+		log.Fatal(err)
+	}
 	limiter := rate.NewLimiter(args.ratePerSecond, 1)
+	workersPerEndpoint := args.concurrency / len(args.endpoints)
+	var workerChans []*workerChan
+	var workersWG sync.WaitGroup
 
-	var maxRunTime time.Duration
-	if args.duration.set {
-		maxRunTime = time.Duration(args.duration.value * 1000000000)
+	if args.jsonDecoder != nil {
+		workerChans = createChannels(args.concurrency, &workersWG)
+
+		go func() {
+			SetupOps(&args, workerChans, credential)
+			closeAllWorkerChannels(workerChans)
+		}()
 	}
 
-	runstart := time.Now()
-	for i := 0; i < args.concurrency; i++ {
-		var obj *DummyReader
-		if args.optype == "multipartput" {
-			obj = NewDummyReader(args.partsize)
-		} else {
-			obj = NewDummyReader(args.osize)
+	for i, endpoint := range args.endpoints {
+		endpointStartTime := time.Now()
+		for currEndpointWorkerId := 0; currEndpointWorkerId < workersPerEndpoint; currEndpointWorkerId++ {
+			workerId := i*workersPerEndpoint + currEndpointWorkerId
+			var workChan *workerChan
+			// if replay or a mixed workload setup a channel for each worker
+			if args.jsonDecoder != nil {
+				workChan = workerChans[workerId]
+				workChan.wg.Add(1)
+			}
+			go worker(c, args, credential, workerId, endpoint, endpointStartTime, limiter, workChan)
 		}
-
-		go func(id int) {
-			tlc := &tls.Config{
-				InsecureSkipVerify: true,
-			}
-			tr := &http.Transport{
-				TLSClientConfig:    tlc,
-				DisableCompression: true,
-				Dial: (&net.Dialer{
-					Timeout:   60 * time.Second,
-					KeepAlive: 180 * time.Second,
-				}).Dial,
-				TLSHandshakeTimeout: 60 * time.Second,
-				IdleConnTimeout:     0,
-			}
-			httpClient := &http.Client{Transport: tr}
-
-			s3Config := aws.NewConfig().
-				WithRegion(args.region).
-				WithCredentials(creds).
-				WithEndpoint(args.endpoint).
-				WithHTTPClient(httpClient).
-				WithDisableComputeChecksums(true).
-				WithS3ForcePathStyle(true)
-			if args.retrySleep == 0 {
-				s3Config.Retryer = client.DefaultRetryer{args.retries}
-			} else {
-				s3Config.Retryer = &CustomRetryer{maxRetries: args.retries, retrySleepPeriodMs: args.retrySleep, defaultRetryer: client.DefaultRetryer{args.retries}}
-			}
-			s3Session, err := session.NewSession(s3Config)
-			if err != nil {
-				log.Fatal("Failed to create an S3 session", err)
-			}
-
-			svc := s3.New(s3Session)
-
-			svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
-				userAgent := userAgentString + r.HTTPRequest.UserAgent()
-				r.HTTPRequest.Header.Set("User-Agent", userAgent)
-			})
-
-			var r = result{0, 0, 0, 0, 0, 0, 0, 0, []detail{}}
-
-			if args.logging {
-				r.data = make([]detail, 0, args.nrequests.value/args.concurrency*args.repeat)
-			}
-
-			var runNum uint64
-
-			if args.duration.set {
-				runNum = math.MaxUint64
-			} else {
-				runNum = uint64(args.nrequests.value/args.concurrency) - 1
-			}
-
-			for j := 0; uint64(j) <= runNum; j++ {
-				obj.Offset = 0
-				limiter.Wait(context.Background())
-
-				var start time.Time
-				var err error
-				var keyName = args.objectprefix + "-" + strconv.Itoa(id) + "-" + strconv.Itoa(j)
-
-				switch {
-				case args.overwrite == 1:
-					keyName = args.objectprefix
-				case args.overwrite == 2:
-					keyName = args.objectprefix + "-" + strconv.Itoa(j)
-
-				}
-
-				_ = args.lockstep
-
-				for repcount := 0; repcount < args.repeat; repcount++ {
-					switch {
-					case args.optype == "options":
-						r.count++
-						if req, err := http.NewRequest("OPTIONS", args.endpoint+"/", nil); err != nil {
-							log.Print("Creating OPTIONS request failed:", err)
-							r.failcount++
-						} else {
-							start = time.Now()
-							if resp, doerr := httpClient.Do(req); doerr != nil {
-								log.Print("OPTIONS request failed:", doerr)
-								r.failcount++
-							} else {
-								io.Copy(ioutil.Discard, resp.Body)
-								resp.Body.Close()
-							}
-						}
-
-					case args.optype == "put":
-						cl := args.osize
-						obj.SetData(keyName)
-						r.uniqObjNum++
-
-						params := &s3.PutObjectInput{
-							Bucket:        aws.String(args.bucketname),
-							Key:           aws.String(keyName),
-							ContentLength: &cl,
-							Body:          obj,
-							StorageClass:  &sc,
-							Metadata:      parseMetadataString(args.metadata),
-						}
-						if args.tagging != "" {
-							params.SetTagging(args.tagging)
-						}
-						r.count++
-						start = time.Now()
-						_, err = svc.PutObject(params)
-						if err == nil {
-							r.sumObjSize += cl
-						}
-
-					case args.optype == "puttagging":
-						// generate tagging struct
-						var tags s3.Tagging
-						tags.TagSet = make([]*s3.Tag, 0)
-						if args.tagging != "" {
-							// tags are supplied like so: tag1=value2&tag2=value&...
-							pairs := strings.Split(args.tagging, "&")
-							for index := range pairs {
-								keyvalue := strings.Split(pairs[index], "=")
-								if len(keyvalue) != 2 {
-									log.Fatal("Invalid tagging string supplied. Must be formatted like: 'tag1=value1&tage2=value2...'")
-								}
-								t := s3.Tag{
-									Key:   aws.String(keyvalue[0]),
-									Value: aws.String(keyvalue[1]),
-								}
-								tags.TagSet = append(tags.TagSet, &t)
-							}
-						}
-
-						params := &s3.PutObjectTaggingInput{
-							Bucket:  aws.String(args.bucketname),
-							Key:     aws.String(keyName),
-							Tagging: &tags,
-						}
-						r.uniqObjNum++
-						r.count++
-						_, err = svc.PutObjectTagging(params)
-
-					case args.optype == "updatemeta":
-						// generate tagging struct
-						params := &s3.CopyObjectInput{
-							Bucket:            aws.String(args.bucketname),
-							Key:               aws.String(keyName),
-							CopySource:        aws.String(args.bucketname + "/" + keyName),
-							MetadataDirective: aws.String("REPLACE"),
-							Metadata:          parseMetadataString(args.metadata),
-						}
-						r.uniqObjNum++
-						r.count++
-						_, err = svc.CopyObject(params)
-
-					case args.optype == "multipartput":
-						cl := args.partsize
-						obj.SetData(keyName)
-						r.uniqObjNum++
-						params := &s3.CreateMultipartUploadInput{
-							Bucket:       aws.String(args.bucketname),
-							Key:          aws.String(keyName),
-							StorageClass: &sc,
-							Metadata:     parseMetadataString(args.metadata),
-						}
-
-						numparts := int64(math.Ceil(float64(args.osize) / float64(args.partsize)))
-						// this is for if the last part won't be the same size
-						lastobj := obj
-						if numparts != args.osize/args.partsize {
-							lastobj = NewDummyReader(args.osize - args.partsize*(numparts-1))
-							lastobj.SetData(keyName)
-						}
-
-						r.count++
-						start = time.Now()
-						var output *s3.CreateMultipartUploadOutput
-						output, err = svc.CreateMultipartUpload(params)
-
-						if err == nil {
-							uploadId := output.UploadId
-							partdata := make([]*s3.CompletedPart, 0, numparts)
-							uparams := &s3.UploadPartInput{
-								Bucket:        aws.String(args.bucketname),
-								Key:           aws.String(keyName),
-								ContentLength: &cl,
-								Body:          obj,
-								UploadId:      uploadId,
-							}
-							for partnum := int64(1); partnum <= numparts-1; partnum++ {
-								/* In a more realistic scenario we would want to upload parts concurrently,
-								but concurrency is already one of the test options... might want to figure out
-								if/how this should consider the concurrency option before adding concurrency here.
-								*/
-								uparams.SetPartNumber(partnum)
-
-								var uoutput *s3.UploadPartOutput
-								uoutput, err = svc.UploadPart(uparams)
-								if err != nil {
-									break
-								}
-								part := &s3.CompletedPart{}
-								part.SetPartNumber(partnum)
-								part.SetETag(*uoutput.ETag)
-								partdata = append(partdata, part)
-							}
-
-							// Don't upload the last part if we had any part upload failures.
-							if err == nil {
-								uparams.SetBody(lastobj)
-								uparams.SetContentLength(lastobj.Size)
-								uparams.SetPartNumber(numparts)
-								var uoutput *s3.UploadPartOutput
-								uoutput, err = svc.UploadPart(uparams)
-								if err == nil {
-									part := &s3.CompletedPart{}
-									part.SetPartNumber(numparts)
-									part.SetETag(*uoutput.ETag)
-									partdata = append(partdata, part)
-								}
-							}
-
-							if err != nil {
-								aparams := &s3.AbortMultipartUploadInput{
-									Bucket:   aws.String(args.bucketname),
-									Key:      aws.String(keyName),
-									UploadId: uploadId,
-								}
-								svc.AbortMultipartUpload(aparams)
-							} else {
-								cparams := &s3.CompleteMultipartUploadInput{
-									Bucket:   aws.String(args.bucketname),
-									Key:      aws.String(keyName),
-									UploadId: uploadId,
-								}
-
-								cpartdata := &s3.CompletedMultipartUpload{Parts: partdata}
-								cparams.SetMultipartUpload(cpartdata)
-
-								_, err = svc.CompleteMultipartUpload(cparams)
-								if err == nil {
-									r.sumObjSize += args.osize
-								}
-							}
-						}
-
-					case args.optype == "get":
-						params := &s3.GetObjectInput{
-							Bucket: aws.String(args.bucketname),
-							Key:    aws.String(keyName),
-							Range:  aws.String(args.objrange),
-						}
-						var out *s3.GetObjectOutput
-						r.uniqObjNum++
-						r.count++
-						start = time.Now()
-						out, err = identityGetObject(svc, params, args.verify)
-						if err == nil {
-							r.sumObjSize += *out.ContentLength
-						}
-
-					case args.optype == "head":
-						params := &s3.HeadObjectInput{
-							Bucket: aws.String(args.bucketname),
-							Key:    aws.String(keyName),
-						}
-						r.uniqObjNum++
-						r.count++
-						start = time.Now()
-						_, err = svc.HeadObject(params)
-
-					case args.optype == "delete":
-						params := &s3.DeleteObjectInput{
-							Bucket: aws.String(args.bucketname),
-							Key:    aws.String(keyName),
-						}
-						r.uniqObjNum++
-						r.count++
-						start = time.Now()
-						_, err = svc.DeleteObject(params)
-
-					case args.optype == "randget":
-						var objnum int
-						if runNum <= 0 {
-							objnum = 0
-						} else {
-							objnum = rand.Intn(int(runNum))
-						}
-						getParams := &s3.GetObjectInput{
-							Bucket: aws.String(args.bucketname),
-							Key:    aws.String(args.objectprefix + "-" + strconv.Itoa(id) + "-" + strconv.Itoa(objnum)),
-							Range:  aws.String(args.objrange),
-						}
-						var out *s3.GetObjectOutput
-						r.uniqObjNum++
-						r.count++
-						start = time.Now()
-						out, err = identityGetObject(svc, getParams, args.verify)
-						if err == nil {
-							r.sumObjSize += *out.ContentLength
-						}
-
-					case args.optype == "putget":
-						cl := args.osize
-						obj.SetData(keyName)
-						r.uniqObjNum++
-						putParams := &s3.PutObjectInput{
-							Bucket:        aws.String(args.bucketname),
-							Key:           aws.String(keyName),
-							ContentLength: &cl,
-							Body:          obj,
-							StorageClass:  &sc,
-							Metadata:      parseMetadataString(args.metadata),
-						}
-						if args.tagging != "" {
-							putParams.SetTagging(args.tagging)
-						}
-
-						getParams := &s3.GetObjectInput{
-							Bucket: aws.String(args.bucketname),
-							Key:    aws.String(keyName),
-							Range:  aws.String(args.objrange),
-						}
-						r.count++
-						start = time.Now()
-						_, err = svc.PutObject(putParams)
-						if err == nil {
-							var out *s3.GetObjectOutput
-							r.sumObjSize += cl
-							r.count++
-							out, err = identityGetObject(svc, getParams, args.verify)
-							if err == nil {
-								r.sumObjSize += *out.ContentLength
-							}
-						}
-
-					case args.optype == "putget9010r":
-						cl := args.osize
-						obj.SetData(keyName)
-						r.uniqObjNum++
-						putParams := &s3.PutObjectInput{
-							Bucket:        aws.String(args.bucketname),
-							Key:           aws.String(keyName),
-							ContentLength: &cl,
-							Body:          obj,
-							StorageClass:  &sc,
-							Metadata:      parseMetadataString(args.metadata),
-						}
-						if args.tagging != "" {
-							putParams.SetTagging(args.tagging)
-						}
-						r.count++
-						start = time.Now()
-						_, err = svc.PutObject(putParams)
-						if err == nil {
-							r.sumObjSize += cl
-						}
-						if j%10 == 0 {
-							objnum := rand.Intn(j + 1)
-							getParams := &s3.GetObjectInput{
-								Bucket: aws.String(args.bucketname),
-								Key:    aws.String(args.objectprefix + "-" + strconv.Itoa(id) + "-" + strconv.Itoa(objnum)),
-								Range:  aws.String(args.objrange),
-							}
-							if err == nil {
-								var out *s3.GetObjectOutput
-								r.count++
-								out, err = identityGetObject(svc, getParams, args.verify)
-								if err == nil {
-									r.sumObjSize += *out.ContentLength
-								}
-							}
-						}
-					}
-					if err != nil {
-						r.failcount++
-						awsErr, ok := err.(awserr.Error)
-						if awsErr != nil && ok {
-							log.Print("Failed:", awsErr.Code(), awsErr.Error(), awsErr.Message())
-						} else {
-							log.Print("Failed:", err.Error())
-						}
-					}
-					elapsed := time.Since(start)
-
-					if j == 0 {
-						r.min = elapsed
-					} else if elapsed < r.min {
-						r.min = elapsed
-					}
-
-					if elapsed > r.max {
-						r.max = elapsed
-					}
-
-					r.elapsedSum += elapsed
-					r.elapsedSumSquared += elapsed.Seconds() * elapsed.Seconds()
-
-					if args.logging {
-						r.data = append(r.data, detail{start, elapsed})
-					}
-
-					if args.duration.set && time.Since(runstart) >= maxRunTime {
-						c <- r
-						return
-					}
-				}
-			}
-			c <- r
-		}(i)
 	}
+	if args.jsonDecoder != nil {
+		workersWG.Wait()
+	}
+}
 
-	// Aggregate results across all clients.
-	aggregateResults := result{0, 0, 0, 0, 0, 0, 0, 0, []detail{}}
-	aggregateResults.min = math.MaxInt64
+func loadCredentialProfile(profile string, nosign bool) (*credentials.Credentials, error) {
+	if nosign {
+		return credentials.AnonymousCredentials, nil
+	}
+	providers := make([]credentials.Provider, 0)
+	if profile == "" {
+		providers = append(providers, &credentials.EnvProvider{})
+	}
+	providers = append(providers, &credentials.SharedCredentialsProvider{Profile: profile})
+	credential := credentials.NewChainCredentials(providers)
+	_, err := credential.Get() // invoke it here as a validation of loading credentials
+	return credential, err
+}
+
+func ReceiveS3Op(svc *s3.S3, httpClient *http.Client, args *parameters, durationLimit *durationSetting, limiter *rate.Limiter, workersChan *workerChan, r *result) {
+	for op := range workersChan.workChan {
+		args.osize = int64(op.Size)
+		args.bucketname = op.Bucket + "s3tester"
+		// need to mock up garbage metadata if it is a SUPD S3 event
+		if op.Event == "updatemeta" {
+			args.metadata = metadataValue(int(op.Size))
+		}
+		sendRequest(svc, httpClient, op.Event, op.Key, args, r, limiter)
+		if durationLimit.enabled() {
+			return
+		}
+	}
+	workersChan.wg.Done()
+}
+
+func sendRequest(svc *s3.S3, httpClient *http.Client, optype string, keyName string, args *parameters, r *result, limiter *rate.Limiter) {
+	r.Count++
+	start := time.Now()
+	err := DispatchOperation(svc, httpClient, optype, keyName, args, r, int64(args.nrequests.value))
+	elapsed := time.Since(start)
+	r.RecordLatency(elapsed)
+
+	if err != nil {
+		r.Failcount++
+		log.Printf("Failed %s on object '%s/%s': %v", args.optype, args.bucketname, keyName, err)
+	}
+	r.elapsedSum += elapsed
 
 	if args.logging {
-		detailed = make([]detail, 0, args.concurrency*aggregateResults.count)
+		r.data = append(r.data, detail{start, elapsed})
+	}
+
+	if limiter.Limit() != rate.Inf {
+		limiter.Wait(context.Background())
+	}
+}
+
+func worker(results chan<- result, args parameters, credentials *credentials.Credentials, id int, endpoint string, runstart time.Time, limiter *rate.Limiter, workerChan *workerChan) {
+	httpClient := MakeHTTPClient()
+	svc := MakeS3Service(httpClient, args.retrySleep, args.retries, endpoint, args.region, args.consistencyControl, credentials)
+	var source *rand.Rand
+
+	r := NewResult()
+	r.Endpoint = endpoint
+	r.startTime = runstart
+
+	if args.logging {
+		r.data = make([]detail, 0, args.nrequests.value/args.concurrency*args.attempts)
+	}
+
+	if args.min != 0 && args.max != 0 {
+		source = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+
+	durationLimit := NewDurationSetting(args.duration, runstart)
+
+	if workerChan != nil {
+		ReceiveS3Op(svc, httpClient, &args, durationLimit, limiter, workerChan, &r)
+	} else {
+		maxRequestsPerWorker := int64(args.nrequests.value / args.concurrency)
+		if args.duration.set && args.optype != "get" {
+			maxRequestsPerWorker = math.MaxInt64 / int64(args.concurrency)
+		}
+		for j := int64(0); j < maxRequestsPerWorker; j++ {
+			var keyName string
+			switch args.overwrite {
+			case 1:
+				keyName = args.objectprefix
+			case 2:
+				keyName = args.objectprefix + "-" + strconv.FormatInt(j, 10)
+			default:
+				keyName = args.objectprefix + "-" + strconv.FormatInt(int64(id)*maxRequestsPerWorker+j, 10)
+			}
+
+			r.incrementUniqObjNumCount(args.duration.set)
+
+			for repcount := 0; repcount < args.attempts; repcount++ {
+				if source != nil {
+					//size command line arg usually sets the size for each request we need to overwrite
+					// with new random size per request
+					newSize := randMinMax(source, args.min, args.max)
+					args.osize = newSize
+				}
+
+				sendRequest(svc, httpClient, args.optype, keyName, &args, &r, limiter)
+
+				if durationLimit.enabled() {
+					results <- r
+					return
+				}
+			}
+		}
+	}
+	results <- r
+}
+
+func (this *result) incrementUniqObjNumCount(isDurationSet bool) {
+	// This feature is very much tied to the args.attempts option and doesn't work when using duration to get the same values over and over again.
+	if this.Operation != "options" && !(isDurationSet && (this.Operation == "get" || this.Operation == "randget")) {
+		this.UniqObjNum++
+	}
+}
+
+func collectWorkerResult(c <-chan result, args parameters, startTime time.Time) results {
+	workersPerEndpoint := args.concurrency / len(args.endpoints)
+	workerWorkload := args.nrequests.value / args.concurrency
+	endpointResultMap := make(map[string]*result)
+	if args.logging {
+		detailed = make([]detail, 0)
 	}
 
 	for i := 0; i < args.concurrency; i++ {
 		r := <-c
-		aggregateResults.sumObjSize += r.sumObjSize
-		aggregateResults.uniqObjNum += int(math.Ceil(float64(r.uniqObjNum) / float64(args.repeat)))
-		aggregateResults.count += r.count
-		aggregateResults.failcount += r.failcount
-		aggregateResults.elapsedSum += r.elapsedSum
-		aggregateResults.elapsedSumSquared += r.elapsedSumSquared
-
-		if r.min < aggregateResults.min {
-			aggregateResults.min = r.min
+		// merge results
+		if _, hasKey := endpointResultMap[r.Endpoint]; !hasKey {
+			// init the endpointResultMap, Concurrency is the counter of the workers that have been collected
+			r.Concurrency = 1
+			endpointResultMap[r.Endpoint] = &r
+		} else {
+			mergeResult(endpointResultMap[r.Endpoint], &r)
+			endpointResultMap[r.Endpoint].Concurrency++
 		}
 
-		if r.max > aggregateResults.max {
-			aggregateResults.max = r.max
+		if endpointResultMap[r.Endpoint].Concurrency == workersPerEndpoint {
+			finishEndpointResultCollection(endpointResultMap[r.Endpoint], r.startTime, args.attempts, args.overwrite, workerWorkload)
 		}
 
 		if args.logging {
 			detailed = append(detailed, r.data...)
 		}
 	}
+	testResult := processEndpointResults(endpointResultMap, args.endpoints)
+	testResult.CummulativeResult.elapsedTime = time.Since(startTime)
+	return testResult
+}
 
-	if aggregateResults.failcount > 0 && aggregateResults.uniqObjNum >= aggregateResults.failcount {
-		aggregateResults.uniqObjNum -= aggregateResults.failcount
+func finishEndpointResultCollection(endpointResult *result, startTime time.Time, repeat, overwrite, workload int) {
+	endpointResult.elapsedTime = time.Since(startTime)
+	// TODO: not sure if we should also handle the case where Failcount > UniqObjNum
+	// if that won't happend we can simply remove the if statement
+	if endpointResult.Failcount > 0 && endpointResult.UniqObjNum >= endpointResult.Failcount {
+		endpointResult.UniqObjNum -= endpointResult.Failcount
+	}
+	endpointResult.correctEndpointUniqObjCountWithOverwriteSetting(overwrite, workload)
+}
+
+func mergeResult(aggregateResults, r *result) {
+	aggregateResults.latencies.Merge(r.latencies)
+	aggregateResults.sumObjSize += r.sumObjSize
+	aggregateResults.UniqObjNum += r.UniqObjNum
+	aggregateResults.Count += r.Count
+	aggregateResults.Failcount += r.Failcount
+	aggregateResults.elapsedSum += r.elapsedSum
+}
+
+func (r *result) correctEndpointUniqObjCountWithOverwriteSetting(overwrite, workload int) {
+	// this function should only be invoked by an endpoint result
+	// unique obj count should be consist with overwrite setting
+	if overwrite == 1 && r.UniqObjNum > 0 {
+		r.UniqObjNum = 1
+	} else if overwrite == 2 && r.UniqObjNum > workload {
+		r.UniqObjNum = workload
+	}
+}
+
+// this function will return a results struct will all the worker results merged
+func processEndpointResults(endpointResultMap map[string]*result, endpoints []string) results {
+	if len(endpoints) == 1 {
+		testResult := results{}
+		testResult.CummulativeResult = *endpointResultMap[endpoints[0]]
+		testResult.CummulativeResult.Endpoint = ""
+		return testResult
+	}
+	testResult := results{}
+	testResult.CummulativeResult = NewResult()
+	testResult.PerEndpointResult = make([]*result, len(endpointResultMap))
+	counter := 0
+	for _, endpointResult := range endpointResultMap {
+		testResult.PerEndpointResult[counter] = endpointResult
+		counter++
+		mergeResult(&testResult.CummulativeResult, endpointResult)
+	}
+	return testResult
+}
+
+func processTestResult(testResult *results, args parameters) {
+	cummulativeResult := &testResult.CummulativeResult
+	cummulativeResult.Operation = args.optype
+	cummulativeResult.Concurrency = args.concurrency
+	setupResultStat(cummulativeResult)
+
+	for _, endpointResult := range testResult.PerEndpointResult {
+		setupResultStat(endpointResult)
 	}
 
-	runelapsed := time.Since(runstart)
-	printResults(aggregateResults, args.optype, args.concurrency, runelapsed)
-
-	return float64(aggregateResults.count) / runelapsed.Seconds(), aggregateResults.failcount > 0
+	cummulativeResult.Category = args.bucketname + "-" + cummulativeResult.Operation + "-" + strconv.Itoa(cummulativeResult.Concurrency) + "-" + strconv.FormatInt(cummulativeResult.sumObjSize, 10)
+	rand.Seed(time.Now().Unix())
+	cummulativeResult.UniqueName = cummulativeResult.Category + "-" + time.Now().UTC().Format(time.RFC3339) + "-" + strconv.Itoa(rand.Intn(100))
 }
 
-func calcStats(results result, concurrency int, runtime time.Duration) stats {
-	var runStats stats
+func setupResultStat(testResult *result) {
+	elapsedTime := testResult.elapsedTime
+	calcStats(testResult, testResult.Concurrency, elapsedTime)
+	roundResult(testResult)
+	processPercentiles(testResult)
 
-	runStats.mean = results.elapsedSum / time.Duration(results.count)
-
-	stddev := math.Sqrt(results.elapsedSumSquared/float64(results.count) - runStats.mean.Seconds()*runStats.mean.Seconds())
-	runStats.stddev = time.Duration(int64(stddev * 1000000000))
-
-	runStats.nominalThrougput = 1.0 / runStats.mean.Seconds() * float64(concurrency)
-	runStats.actualThrougput = float64(results.count) / runtime.Seconds()
-	runStats.bodyThrougput = float64(results.sumObjSize) / 1024 / 1024 / runtime.Seconds()
-
-	return runStats
+	minReqTime := time.Duration(testResult.latencies.Min() * 1e4)
+	maxReqTime := time.Duration(testResult.latencies.Max() * 1e4)
+	testResult.TotalElapsedTime = float64(elapsedTime) / float64(time.Millisecond)
+	testResult.MinimumRequestTime = float64(minReqTime) / float64(time.Millisecond)
+	testResult.MaximumRequestTime = float64(maxReqTime) / float64(time.Millisecond)
 }
 
-func printResults(results result, optype string, concurrency int, runtime time.Duration) {
-	runStats := calcStats(results, concurrency, runtime)
+func calcStats(results *result, concurrency int, elapsedTime time.Duration) {
+	mean := results.elapsedSum / time.Duration(results.Count)
+	results.AverageRequestTime = float64(mean) / float64(time.Millisecond)
+	results.NominalRequestsPerSec = 1.0 / mean.Seconds() * float64(concurrency)
+	results.ActualRequestsPerSec = float64(results.Count) / elapsedTime.Seconds()
+	results.ContentThroughput = float64(results.sumObjSize) / 1024 / 1024 / elapsedTime.Seconds()
+	results.AverageObjectSize = float64(results.sumObjSize) / float64(results.Count)
+}
 
-	fmt.Printf("Operation: %s\n", optype)
-	fmt.Printf("Concurrency: %d\n", concurrency)
-	fmt.Printf("Total number of requests: %d\n", results.count)
-	fmt.Printf("Total number of unique objects: %d\n", results.uniqObjNum)
-	fmt.Printf("Failed requests: %d\n", results.failcount)
-	fmt.Printf("Total elapsed time: %s\n", runtime)
-	fmt.Printf("Average request time: %s\n", runStats.mean)
-	fmt.Printf("Standard deviation: %s\n", runStats.stddev)
-	fmt.Printf("Minimum request time: %s\n", results.min)
-	fmt.Printf("Maximum request time: %s\n", results.max)
-	fmt.Printf("Nominal requests/s: %.1f\n", runStats.nominalThrougput)
-	fmt.Printf("Actual requests/s: %.1f\n", runStats.actualThrougput)
-	fmt.Printf("Content throughput: %.6f MB/s\n", runStats.bodyThrougput)
+func roundResult(results *result) {
+	results.NominalRequestsPerSec = roundFloat(results.NominalRequestsPerSec, 1)
+	results.ActualRequestsPerSec = roundFloat(results.ActualRequestsPerSec, 1)
+	results.ContentThroughput = roundFloat(results.ContentThroughput, 6)
+	results.AverageObjectSize = roundFloat(results.AverageObjectSize, 0)
+}
+
+var percentiles []float64 = []float64{50, 75, 90, 95, 99, 99.9}
+
+func processPercentiles(results *result) {
+	results.Percentiles = make(map[string]float64)
+	for _, percentile := range percentiles {
+		quantileValue := float64(results.latencies.ValueAtQuantile(percentile)) / 1e2
+		results.Percentiles[convertFloatToString(percentile)] = quantileValue
+	}
+}
+
+func printResponseTimeDistribution(percentilesMap map[string]float64) {
+	fmt.Println("Response Time Percentiles")
+	for _, percentile := range percentiles {
+		key := convertFloatToString(percentile)
+		quantileValue := convertFloatToString(percentilesMap[key])
+		fmt.Printf("%-5v  :   %-5v\n", key, quantileValue+" ms")
+	}
+}
+
+func convertFloatToString(f float64) string {
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+
+func roundFloat(in float64, point int) float64 {
+	return float64(int(math.Round(in*math.Pow10(point)))) / math.Pow10(point)
+}
+
+func printTestResult(testResult *results, isJson bool) {
+	if isJson {
+		printJsonResult(*testResult)
+	} else {
+		printResults(*testResult)
+	}
+}
+
+func printResults(testResult results) {
+	if len(testResult.PerEndpointResult) > 1 {
+		fmt.Println("\n\t--- Result per Endpoint ---")
+		for _, endpointResult := range testResult.PerEndpointResult {
+			printResult(*endpointResult)
+		}
+	}
+
+	fmt.Println("\n\t--- Total Results ---")
+	printResult(testResult.CummulativeResult)
+	HistogramSummary(testResult.CummulativeResult.latencies)
+}
+
+func printResult(results result) {
+	if results.Endpoint != "" {
+		fmt.Printf("- Endpoint: %s\n", results.Endpoint)
+	} else { // Total result prints the operation & concurrency rather than endpoint
+		fmt.Printf("Operation: %s\n", results.Operation)
+	}
+	fmt.Printf("Concurrency: %d\n", results.Concurrency)
+	fmt.Printf("Total number of requests: %d\n", results.Count)
+
+	if results.UniqObjNum != 0 {
+		fmt.Printf("Total number of unique objects: %d\n", results.UniqObjNum)
+	}
+
+	fmt.Printf("Failed requests: %d\n", results.Failcount)
+
+	fmt.Printf("Total elapsed time: %s\n", time.Duration(results.TotalElapsedTime*float64(time.Millisecond)))
+	fmt.Printf("Average request time: %s\n", time.Duration(results.AverageRequestTime*float64(time.Millisecond)))
+	fmt.Printf("Minimum request time: %s\n", time.Duration(results.MinimumRequestTime*float64(time.Millisecond)))
+	fmt.Printf("Maximum request time: %s\n", time.Duration(results.MaximumRequestTime*float64(time.Millisecond)))
+
+	fmt.Printf("Nominal requests/s: %.1f\n", results.NominalRequestsPerSec)
+	fmt.Printf("Actual requests/s: %.1f\n", results.ActualRequestsPerSec)
+	fmt.Printf("Content throughput: %.6f MB/s\n", results.ContentThroughput)
+	fmt.Printf("Average Object Size: %v\n", results.AverageObjectSize)
+
+	printResponseTimeDistribution(results.Percentiles)
+}
+
+func printJsonResult(testResult results) {
+	// switch between human-readable json output & machine-friendly json output
+	// jsonResult, err := json.MarshalIndent(testResult, "", "    ")
+	jsonResult, err := json.Marshal(testResult)
+	if err != nil {
+		fmt.Println("Error when parsing result to json")
+		return
+	}
+	fmt.Println(string(jsonResult))
 }
 
 func main() {
-	optypes := []string{"put", "multipartput", "get", "puttagging", "updatemeta", "randget", "delete", "options", "head", "putget", "putget9010r"}
-	operationListString := strings.Join(optypes[:], ", ")
+	args := parseArgs()
 
-	var nrequests intFlag
-	var duration intFlag
-
-	nrequests = NewintFlag(1000)
-
-	flag.Var(&duration, "duration", "Test duration in seconds")
-	flag.Var(&nrequests, "requests", "Total number of requests")
-
-	var concurrency = flag.Int("concurrency", 1, "Maximum concurrent requests (0=scan concurrency, run with ulimit -n 16384)")
-	var osize = flag.Int64("size", 30*1024, "Object size. Note that s3tester is not ideal for very large objects as the entire body must be read for v4 signing and the aws sdk does not support v4 chunked. Performance may degrade as size increases due to the use of v4 signing without chunked support")
-	var endpoint = flag.String("endpoint", "https://127.0.0.1:18082", "target endpoint")
-	var optype = flag.String("operation", "put", "operation type: "+operationListString)
-	var bucketname = flag.String("bucket", "test", "bucket name (needs to exist)")
-	var objectprefix = flag.String("prefix", "testobject", "object name prefix")
-	var tagging = flag.String("tagging", "", "The tag-set for the object. The tag-set must be formatted as such: 'tag1=value1&tage2=value2'. Used for put, puttagging, putget and putget9010r.")
-	var metadata = flag.String("metadata", "", "The metadata to use for the objects. The string must be formatted as such: 'key1=value1&key2=value2'. Used for put, updatemeta, multipartput, putget and putget9010r.")
-	var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
-	var logdetail = flag.String("logdetail", "", "write detailed log to file")
-	var maxRate = flag.Float64("ratelimit", math.MaxFloat64, "the total number of operations per second across all threads")
-	var objrange = flag.String("range", "", "Specify range header for GET requests")
-	var reducedRedundancy = flag.Bool("rr", false, "Reduced redundancy storage for PUT requests")
-	var overwrite = flag.Int("overwrite", 0, "Turns a PUT/GET/HEAD into an operation on the same s3 key. (1=all writes/reads are to same object, 2=threads clobber each other but each write/read is to unique objects).")
-	var retries = flag.Int("retries", 0, "Number of retry attempts. Default is 0.")
-	var retrySleep = flag.Int("retrysleep", 0, "How long to sleep in between each retry in milliseconds. Default (0) is to use the default retry method which is an exponential backoff.")
-	var lockstep = flag.Bool("lockstep", false, "Force all threads to advance at the same rate rather than run independently")
-	var repeat = flag.Int("repeat", 1, "Repeat each S3 operation this many times")
-	var region = flag.String("region", "us-east-1", "Region to send requests to")
-	var partsize = flag.Int64("partsize", 5*(1<<20), "Size of each part (min 5MiB); only has an effect when a multipart put is used")
-	var verify = flag.Bool("verify", false, "Verify the retrieved data on a get operation")
-
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "This tool is for generating high performance S3 load against an S3 server.\n")
-		fmt.Fprintf(os.Stderr, "Credentials are read from the environment variables AWS_ACCESS_KEY and AWS_SECRET_ACCESS_KEY.\n")
-		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "Key naming is unique per key unless the 'overwrite' option is used. The naming is as follows:\n")
-		fmt.Fprintf(os.Stderr, "    Key names are equal to \"<prefix>-N-M\" where N is 0..concurrency-1 and M is the request within that connection.\n")
-		fmt.Fprintf(os.Stderr, "This means all the various client operations (GET, PUT, DELETE, etc) will use the same object names assuming the same parameters are used.\n")
-		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "You can control how many client machine cores the tester uses by setting the GOMAXPROCS env variable, e.g. to use 8 cores:\n")
-		fmt.Fprintf(os.Stderr, "    export GOMAXPROCS=8\n")
-		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "Each concurrent stream is done on a persistent HTTP connection.\n")
-		fmt.Fprintf(os.Stderr, "You should expect the very first request on a persistent to take a little longer due to TLS handshake.\n")
-		fmt.Fprintf(os.Stderr, "You can see this effect by setting requests=concurrency\n")
-		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "Client performance will vary based on your machine but as a rule of thumb a modern Core i7 \n")
-		fmt.Fprintf(os.Stderr, "should be able to generate about 5000 30K PUTs/second (should saturate a 1GBps network interface) \n")
-		fmt.Fprintf(os.Stderr, "and 20000 DELETE requests/s (with GOMAXPROCS=# of cores and concurrency>=# of cores)\n")
-		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nVersion: "+VERSION+"\n")
-	}
-	flag.Parse()
-
-	var ratePerSecond = rate.Limit(*maxRate)
-
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
+	if args.cpuprofile != "" {
+		f, err := os.Create(args.cpuprofile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -773,71 +571,9 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	var opTypeExists = false
-	for op := range optypes {
-		if optypes[op] == *optype {
-			opTypeExists = true
-		}
-	}
-
-	if !opTypeExists {
-		log.Fatal("operation type must be one of: " + operationListString)
-	}
-
-	if nrequests.set && nrequests.value <= 0 {
-		log.Fatal("Number of requests must be > 0")
-	}
-
-	if *concurrency <= 0 {
-		log.Fatal("Concurrency must be > 0")
-	}
-
-	if duration.set && nrequests.set {
-		log.Fatal("Using both \"durtation\" and \"nrequests\" are not allowed. Please choose only one of these options.")
-	}
-
-	if nrequests.value < *concurrency {
-		log.Fatal("Number of requests must be greater or equal to concurrency")
-	}
-
-	if *optype == "multipartput" {
-		if *partsize < 5*(1<<20) {
-			log.Fatal("Part size should be 5MiB at minimum")
-		}
-		if int(math.Ceil(float64(*osize)/float64(*partsize))) > 10000 {
-			log.Fatal("The multipart upload will use too many parts (max 10000)")
-		}
-	}
-
-	var hasfailed bool
-
-	args := parameters{
-		concurrency:       *concurrency,
-		osize:             *osize,
-		endpoint:          *endpoint,
-		optype:            *optype,
-		bucketname:        *bucketname,
-		objectprefix:      *objectprefix,
-		ratePerSecond:     ratePerSecond,
-		logging:           *logdetail != "",
-		objrange:          *objrange,
-		reducedRedundancy: *reducedRedundancy,
-		overwrite:         *overwrite,
-		retries:           *retries,
-		retrySleep:        *retrySleep,
-		lockstep:          *lockstep,
-		repeat:            *repeat,
-		region:            *region,
-		partsize:          *partsize,
-		verify:            *verify,
-		tagging:           *tagging,
-		metadata:          *metadata,
-		nrequests:         &nrequests,
-		duration:          &duration,
-	}
-
-	if *concurrency != 0 {
-		_, hasfailed = runtest(args)
+	var totalResults results
+	if args.concurrency != 0 {
+		_, totalResults = runtest(args)
 	} else {
 		previous := 0.0
 		result := 0.0
@@ -848,8 +584,9 @@ func main() {
 			fmt.Printf("Concurrency %d ===> %.1f requests/s\n", c, result)
 		}
 	}
-	if *logdetail != "" {
-		f, err := os.Create(*logdetail)
+
+	if args.logging {
+		f, err := os.Create(args.logdetail)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -858,73 +595,126 @@ func main() {
 			fmt.Fprintf(f, "%f,%f\n", v.ts.Sub(detailed[0].ts).Seconds(), v.elapsed.Seconds())
 		}
 	}
-	if hasfailed {
+
+	if args.loglatency != "" {
+		f, err := os.Create(args.loglatency)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+
+		fmt.Fprintf(f, "from(ms) to(ms) count(operations)\n")
+		for _, v := range totalResults.CummulativeResult.latencies.Distribution() {
+			fmt.Fprintf(f, "%f %f %d\n", float64(v.From)/1e2, float64(v.To)/1e2, v.Count)
+		}
+	}
+
+	if totalResults.CummulativeResult.Failcount > 0 {
 		os.Exit(1)
 	}
 }
 
-// implements io.ReadSeeker
-type DummyReader struct {
-	Size   int64
-	Offset int64
-	Data   []byte
+func MakeHTTPClient() *http.Client {
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   60 * time.Second,
+				KeepAlive: 180 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			DisableCompression:  true, // Non-default
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100, // Non-default
+			IdleConnTimeout:     90 * time.Second,
+			TLSClientConfig:     tlsConfig, // Non-default
+			TLSHandshakeTimeout: 60 * time.Second,
+		},
+	}
 }
 
-func NewDummyReader(size int64) *DummyReader {
-	return &DummyReader{Size: size}
-}
-
-func (r *DummyReader) SetData(data string) {
-	r.Data = []byte(data)
-}
-
-func (r *DummyReader) Read(p []byte) (n int, err error) {
-	if len(r.Data) == 0 {
-		n, err = 0, errors.New("Data needs to be set before reading")
-		return
+func MakeS3Service(hclient *http.Client, retrySleep, retries int, endpoint, region, consistencyControl string, credentials *credentials.Credentials) *s3.S3 {
+	s3Config := aws.NewConfig().
+		WithRegion(region).
+		WithCredentials(credentials).
+		WithEndpoint(endpoint).
+		WithHTTPClient(hclient).
+		WithDisableComputeChecksums(true).
+		WithS3ForcePathStyle(true)
+	if retrySleep == 0 {
+		s3Config.Retryer = NewCustomRetryer(retries)
+	} else {
+		s3Config.Retryer = NewRetryerWithSleep(retries, retrySleep)
+	}
+	s3Session, err := session.NewSession(s3Config)
+	if err != nil {
+		log.Fatal("Failed to create an S3 session", err)
 	}
 
-	if r.Offset >= r.Size {
-		n, err = 0, io.EOF
-		return
-	}
+	svc := s3.New(s3Session)
 
-	read := int(r.Size - r.Offset)
-	if len(p) < read {
-		read = len(p)
-	}
-
-	for i := 0; i < read; i++ {
-		p[i] = r.Data[(i+int(r.Offset))%len(r.Data)]
-	}
-
-	r.Offset += int64(read)
-	n, err = read, nil
-	return
-}
-
-func (r *DummyReader) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case io.SeekStart:
-		if offset >= 0 && offset <= r.Size {
-			r.Offset = offset
-			return r.Offset, nil
+	svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
+		userAgent := userAgentString + r.HTTPRequest.UserAgent()
+		r.HTTPRequest.Header.Set("User-Agent", userAgent)
+		if consistencyControl != "" {
+			r.HTTPRequest.Header.Set("Consistency-Control", consistencyControl)
 		}
-		return r.Offset, errors.New(fmt.Sprintf("SeekStart: Cannot seek past start or end of file. offset: %d, size: %d", offset, r.Size))
-	case io.SeekCurrent:
-		off := offset + r.Offset
-		if off >= 0 && off <= r.Size {
-			r.Offset = off
-			return off, nil
+	})
+
+	return svc
+}
+
+// HistogramSummary will generate a power of 2 histogram summary where every successive bin is 2x the last one.
+// The bins are latencies in milliseconds and the values are operation counts.
+func HistogramSummary(h *hdrhistogram.Histogram) {
+	dist := h.Distribution()
+
+	bars := len(dist)
+	var sum, start, end int64
+	end = 2
+
+	var counts []hdrhistogram.Bar
+	var max int64
+
+	// Collect all bins in a new histogram scaled such that each bin is a power of 2.
+	for _, v := range dist {
+		if v.To >= end*100 {
+			counts = append(counts, hdrhistogram.Bar{From: start, To: end - 1, Count: sum})
+
+			if sum > max {
+				max = sum
+			}
+
+			start = end
+			end = end << 1
+			sum = 0
 		}
-		return r.Offset, errors.New(fmt.Sprintf("SeekCurrent: Cannot seek past start or end of file. offset: %d, size: %d", off, r.Size))
-	case io.SeekEnd:
-		off := r.Size - offset
-		if off >= 0 && off <= r.Size {
-			r.Offset = off
-			return off, nil
-		}
-		return r.Offset, errors.New(fmt.Sprintf("SeekEnd: Cannot seek past start or end of file. offset: %d, size: %d", off, r.Size))
+		sum += v.Count
 	}
-	return 0, errors.New("Invalid value of whence")
+
+	counts = append(counts, hdrhistogram.Bar{From: start, To: int64(math.Ceil(float64((dist[bars-1].To)/100) + 1)), Count: sum})
+
+	if sum > max {
+		max = sum
+	}
+
+	// The width we want to print one end of a bin interval with to maintain nice alignment.
+	// Take the end of the last bin and convert it to milliseconds then count the number of
+	// digits in the base 10 representation.
+	intervalWidth := int(math.Floor(math.Log10(float64(dist[bars-1].To)/100) + 1))
+
+	// Count the number of digits in the base 10 representation of the maximum count value
+	// in all bins. This will be used to set the width of all other bin counts.
+	countWidth := int(math.Floor(math.Log10(float64(max)) + 1))
+
+	fmt.Printf("%-[1]*[2]s : Operations\n", intervalWidth*2, "Latency(ms)")
+
+	// Maximum bin width to print out using '|'
+	maxBinWidth := 80.0
+
+	for _, v := range counts {
+		bin := strings.Repeat("|", int(maxBinWidth*float64(v.Count)/float64(max)))
+		fmt.Printf("%[1]*[3]d - %-[1]*[4]d : %-[2]*[5]d |%s\n", intervalWidth, countWidth, v.From, v.To, v.Count, bin)
+	}
 }
