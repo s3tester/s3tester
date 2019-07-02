@@ -2,9 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"hash/fnv"
 	"log"
 	"math"
@@ -12,6 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 type s3op struct {
@@ -211,7 +212,7 @@ func sendS3op(op s3op, params *workloadParams, endpoint string, region string) {
 func createBucket(currentBuckets map[string]bool, bucket string, endpoint string, region string, credential *credentials.Credentials) error {
 	httpClient := MakeHTTPClient()
 
-	svc := MakeS3Service(httpClient, int(0), int(0), endpoint, region, "", credential)
+	svc := MakeS3Service(httpClient, int(0), int(0), endpoint, region, "", credential, 0) // set fanout=0 when creating buckets to dismiss HTTP Header
 
 	// check for bucket existence
 	_, err := svc.CreateBucket(&s3.CreateBucketInput{Bucket: aws.String(bucket),

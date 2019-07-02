@@ -52,6 +52,7 @@ type result struct {
 	UniqObjNum  int    `json:"totalUniqueObjects"`
 	Count       int    `json:"totalRequests"`
 	Failcount   int    `json:"failedRequests"`
+	Fanout      int    `json:"fanout"`
 
 	TotalElapsedTime   float64 `json:"totalElapsedTime (ms)"`
 	AverageRequestTime float64 `json:"averageRequestTime (ms)"`
@@ -282,7 +283,7 @@ func sendRequest(svc *s3.S3, httpClient *http.Client, optype string, keyName str
 
 func worker(results chan<- result, args parameters, credentials *credentials.Credentials, id int, endpoint string, runstart time.Time, limiter *rate.Limiter, workerChan *workerChan) {
 	httpClient := MakeHTTPClient()
-	svc := MakeS3Service(httpClient, args.retrySleep, args.retries, endpoint, args.region, args.consistencyControl, credentials)
+	svc := MakeS3Service(httpClient, args.retrySleep, args.retries, endpoint, args.region, args.consistencyControl, credentials, args.ucopies)
 	var source *rand.Rand
 
 	r := NewResult()
@@ -432,6 +433,7 @@ func processTestResult(testResult *results, args parameters) {
 	cummulativeResult := &testResult.CummulativeResult
 	cummulativeResult.Operation = args.optype
 	cummulativeResult.Concurrency = args.concurrency
+	cummulativeResult.Fanout = args.ucopies
 	setupResultStat(cummulativeResult)
 
 	for _, endpointResult := range testResult.PerEndpointResult {
@@ -472,7 +474,7 @@ func roundResult(results *result) {
 	results.AverageObjectSize = roundFloat(results.AverageObjectSize, 0)
 }
 
-var percentiles []float64 = []float64{50, 75, 90, 95, 99, 99.9}
+var percentiles []float64 = []float64{50, 75, 90, 95, 99, 99.9, 99.99}
 
 func processPercentiles(results *result) {
 	results.Percentiles = make(map[string]float64)
@@ -527,10 +529,15 @@ func printResult(results result) {
 		fmt.Printf("Operation: %s\n", results.Operation)
 	}
 	fmt.Printf("Concurrency: %d\n", results.Concurrency)
+	fmt.Printf("Fanout copies: %d\n", results.Fanout)
 	fmt.Printf("Total number of requests: %d\n", results.Count)
 
 	if results.UniqObjNum != 0 {
 		fmt.Printf("Total number of unique objects: %d\n", results.UniqObjNum)
+	}
+
+	if results.Fanout != 0 {
+		fmt.Printf("Total number of objects including fanout copies: %d\n", results.Fanout*results.Count)
 	}
 
 	fmt.Printf("Failed requests: %d\n", results.Failcount)
@@ -634,7 +641,7 @@ func MakeHTTPClient() *http.Client {
 	}
 }
 
-func MakeS3Service(hclient *http.Client, retrySleep, retries int, endpoint, region, consistencyControl string, credentials *credentials.Credentials) *s3.S3 {
+func MakeS3Service(hclient *http.Client, retrySleep, retries int, endpoint, region, consistencyControl string, credentials *credentials.Credentials, ucopies int) *s3.S3 {
 	s3Config := aws.NewConfig().
 		WithRegion(region).
 		WithCredentials(credentials).
@@ -657,6 +664,12 @@ func MakeS3Service(hclient *http.Client, retrySleep, retries int, endpoint, regi
 	svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
 		userAgent := userAgentString + r.HTTPRequest.UserAgent()
 		r.HTTPRequest.Header.Set("User-Agent", userAgent)
+		if ucopies > 0 && r.Operation.HTTPMethod == "PUT" {
+			r.HTTPRequest.Header.Add("X-Fanout-Copy-Count", fmt.Sprintf("%d", ucopies))
+		}
+		if ucopies >= 0 && r.Operation.HTTPMethod == "GET" {
+			r.HTTPRequest.Header.Add("X-Fanout-Copy-Index", fmt.Sprintf("%d", ucopies))
+		}
 		if consistencyControl != "" {
 			r.HTTPRequest.Header.Set("Consistency-Control", consistencyControl)
 		}

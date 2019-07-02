@@ -70,6 +70,8 @@ type parameters struct {
 	days               int64
 	profile            string
 	nosign             bool
+	fanout             int
+	ucopies            int
 }
 
 func parseArgs() parameters {
@@ -122,6 +124,8 @@ func parse(cmdline []string) (parameters, error) {
 	var workload = flags.String("workload", "", "Filepath to a Mixedworkload JSON formatted file which allows a user to specify a mixture of operations. A sample mixed workload file must be in the format\n'{'mixedWorkload':\n[{'operation':'put','ratio':25},\n{'operationType':'get','ratio':25},\n{'operationType':'updatemeta','ratio':25},\n{'operationType':'delete','ratio':25}]}'.  \nNOTE: The order of operations specified will generate the requests in the same order.\nI.E. If you have delete followed by a put, but no objects on your grid to delete, all your deletes will fail.")
 	var profile = flags.String("profile", "", "Use a specific profile from AWS CLI credential file (https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-profiles.html).")
 	var nosign = flags.Bool("no-sign-request", false, "Do not sign requests. Credentials will not be loaded if this argument is provided.")
+
+	var fanout = flags.Int("fanout", 0, "Number of fanout object containing one or more unique copies of the provided content.")
 
 	flags.Usage = func() {
 		fmt.Fprintf(os.Stderr, "This tool is for generating high performance S3 load against an S3 server.\n")
@@ -225,12 +229,19 @@ func parse(cmdline []string) (parameters, error) {
 		return parameters{}, errors.New("Repeat must be >= 0")
 	}
 
+	if *fanout < 0 {
+		return parameters{}, errors.New("Fanout must be >= 0")
+	}
+
 	if *nosign && *profile != "" {
 		return parameters{}, errors.New("Cannot load credential profile if argument nosign is provided")
 	}
 
 	// attempts indicate the number of times we perform S3 operation, the default attempts is 1
 	attempts := 1 + *repeat
+
+	// ucopies indicate the number of unique fanout copies, the ucopies is 0
+	ucopies := 0 + *fanout
 
 	if *optype == "multipartput" {
 		if *partsize < 5*(1<<20) {
@@ -313,6 +324,7 @@ func parse(cmdline []string) (parameters, error) {
 		days:               *days,
 		profile:            *profile,
 		nosign:             *nosign,
+		ucopies:            ucopies,
 	}
 
 	return args, nil
