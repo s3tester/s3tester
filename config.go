@@ -5,13 +5,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"golang.org/x/time/rate"
 	"log"
 	"math"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+
+	"golang.org/x/time/rate"
 )
 
 // intFlag is used to differentiate user-defined value from default value
@@ -87,11 +88,13 @@ func parse(cmdline []string) (parameters, error) {
 
 	var duration intFlag
 	nrequests := intFlag{value: 1000, set: false}
+	fanout := intFlag{value: -1, set: false}
 
 	flags := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	flags.Var(&duration, "duration", "Test duration in seconds")
 	flags.Var(&nrequests, "requests", "Total number of requests")
+	flags.Var(&fanout, "fanout", "Total number of unique fanout object - (-1=disable fanout(default), >0=number of copies)")
 
 	var concurrency = flags.Int("concurrency", 1, "Maximum concurrent requests (0=scan concurrency, run with ulimit -n 16384)")
 	var osize = flags.Int64("size", 30*1024, "Object size. Note that s3tester is not ideal for very large objects as the entire body must be read for v4 signing and the aws sdk does not support v4 chunked. Performance may degrade as size increases due to the use of v4 signing without chunked support")
@@ -124,8 +127,6 @@ func parse(cmdline []string) (parameters, error) {
 	var workload = flags.String("workload", "", "Filepath to a Mixedworkload JSON formatted file which allows a user to specify a mixture of operations. A sample mixed workload file must be in the format\n'{'mixedWorkload':\n[{'operation':'put','ratio':25},\n{'operationType':'get','ratio':25},\n{'operationType':'updatemeta','ratio':25},\n{'operationType':'delete','ratio':25}]}'.  \nNOTE: The order of operations specified will generate the requests in the same order.\nI.E. If you have delete followed by a put, but no objects on your grid to delete, all your deletes will fail.")
 	var profile = flags.String("profile", "", "Use a specific profile from AWS CLI credential file (https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-profiles.html).")
 	var nosign = flags.Bool("no-sign-request", false, "Do not sign requests. Credentials will not be loaded if this argument is provided.")
-
-	var fanout = flags.Int("fanout", 0, "Number of fanout object containing one or more unique copies of the provided content.")
 
 	flags.Usage = func() {
 		fmt.Fprintf(os.Stderr, "This tool is for generating high performance S3 load against an S3 server.\n")
@@ -182,6 +183,26 @@ func parse(cmdline []string) (parameters, error) {
 		return parameters{}, errors.New("Number of requests must be > 0")
 	}
 
+	if fanout.set {
+		if *optype == "put" {
+			// fanout must be between 1 and 10,000
+			if 1 <= fanout.value && fanout.value <= 10000 {
+				//ucopies := fanout.value
+			} else {
+				return parameters{}, errors.New("Value of fanout for PUT operation must be between 1 and 10,000")
+			}
+		} else if *optype == "get" {
+			// fanout must be between 0 and 9,999
+			if 0 <= fanout.value && fanout.value <= 9999 {
+				//ucopies := fanout.value
+			} else {
+				return parameters{}, errors.New("Value of fanout for GET operation must be between 0 and 9,999")
+			}
+		} else {
+			return parameters{}, errors.New("Fanout is (currently) only supported in GET or PUT operations")
+		}
+	}
+
 	if *concurrency <= 0 {
 		return parameters{}, errors.New("Concurrency must be > 0")
 	}
@@ -229,19 +250,12 @@ func parse(cmdline []string) (parameters, error) {
 		return parameters{}, errors.New("Repeat must be >= 0")
 	}
 
-	if *fanout < 0 {
-		return parameters{}, errors.New("Fanout must be >= 0")
-	}
-
 	if *nosign && *profile != "" {
 		return parameters{}, errors.New("Cannot load credential profile if argument nosign is provided")
 	}
 
 	// attempts indicate the number of times we perform S3 operation, the default attempts is 1
 	attempts := 1 + *repeat
-
-	// ucopies indicate the number of unique fanout copies, the ucopies is 0
-	ucopies := 0 + *fanout
 
 	if *optype == "multipartput" {
 		if *partsize < 5*(1<<20) {
@@ -324,7 +338,7 @@ func parse(cmdline []string) (parameters, error) {
 		days:               *days,
 		profile:            *profile,
 		nosign:             *nosign,
-		ucopies:            ucopies,
+		ucopies:            fanout.value,
 	}
 
 	return args, nil

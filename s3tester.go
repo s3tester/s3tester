@@ -664,12 +664,15 @@ func MakeS3Service(hclient *http.Client, retrySleep, retries int, endpoint, regi
 	svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
 		userAgent := userAgentString + r.HTTPRequest.UserAgent()
 		r.HTTPRequest.Header.Set("User-Agent", userAgent)
-		if ucopies > 0 && r.Operation.HTTPMethod == "PUT" {
-			r.HTTPRequest.Header.Add("X-Fanout-Copy-Count", fmt.Sprintf("%d", ucopies))
+		if ucopies >= 0 {
+			if r.Operation.HTTPMethod == "PUT" {
+				r.HTTPRequest.Header.Add("X-Fanout-Copy-Count", fmt.Sprintf("%d", ucopies))
+			}
+			if r.Operation.HTTPMethod == "GET" {
+				r.HTTPRequest.Header.Add("X-Fanout-Copy-Index", fmt.Sprintf("%d", ucopies))
+			}
 		}
-		if ucopies >= 0 && r.Operation.HTTPMethod == "GET" {
-			r.HTTPRequest.Header.Add("X-Fanout-Copy-Index", fmt.Sprintf("%d", ucopies))
-		}
+
 		if consistencyControl != "" {
 			r.HTTPRequest.Header.Set("Consistency-Control", consistencyControl)
 		}
