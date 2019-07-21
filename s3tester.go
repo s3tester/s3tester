@@ -52,6 +52,7 @@ type result struct {
 	UniqObjNum  int    `json:"totalUniqueObjects"`
 	Count       int    `json:"totalRequests"`
 	Failcount   int    `json:"failedRequests"`
+	Fanout      int    `json:"fanout"`
 
 	TotalElapsedTime   float64 `json:"totalElapsedTime (ms)"`
 	AverageRequestTime float64 `json:"averageRequestTime (ms)"`
@@ -283,6 +284,19 @@ func sendRequest(svc *s3.S3, httpClient *http.Client, optype string, keyName str
 func worker(results chan<- result, args parameters, credentials *credentials.Credentials, id int, endpoint string, runstart time.Time, limiter *rate.Limiter, workerChan *workerChan) {
 	httpClient := MakeHTTPClient()
 	svc := MakeS3Service(httpClient, args.retrySleep, args.retries, endpoint, args.region, args.consistencyControl, credentials)
+
+	if args.fanout.set {
+		if args.optype == "put" {
+			svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
+				r.HTTPRequest.Header.Add("X-Fanout-Copy-Count", fmt.Sprintf("%d", args.fanout.value))
+			})
+		} else if args.optype == "get" {
+			svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
+				r.HTTPRequest.Header.Add("X-Fanout-Copy-Index", fmt.Sprintf("%d", args.fanout.value))
+			})
+		}
+	}
+
 	var source *rand.Rand
 
 	r := NewResult()
@@ -432,6 +446,7 @@ func processTestResult(testResult *results, args parameters) {
 	cummulativeResult := &testResult.CummulativeResult
 	cummulativeResult.Operation = args.optype
 	cummulativeResult.Concurrency = args.concurrency
+	cummulativeResult.Fanout = args.fanout.value
 	setupResultStat(cummulativeResult)
 
 	for _, endpointResult := range testResult.PerEndpointResult {
@@ -529,7 +544,12 @@ func printResult(results result) {
 	fmt.Printf("Concurrency: %d\n", results.Concurrency)
 	fmt.Printf("Total number of requests: %d\n", results.Count)
 
-	if results.UniqObjNum != 0 {
+	if results.Operation == "put" && results.Fanout >= 0 {
+		fmt.Printf("Number of Fanout copies: %d\n", results.Fanout)
+		if results.UniqObjNum != 0 {
+			fmt.Printf("Total number of unique objects: %d\n", results.UniqObjNum * results.Fanout)
+		}
+	} else if results.UniqObjNum != 0 {
 		fmt.Printf("Total number of unique objects: %d\n", results.UniqObjNum)
 	}
 

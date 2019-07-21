@@ -70,6 +70,7 @@ type parameters struct {
 	days               int64
 	profile            string
 	nosign             bool
+	fanout             *intFlag
 }
 
 func parseArgs() parameters {
@@ -85,11 +86,13 @@ func parse(cmdline []string) (parameters, error) {
 
 	var duration intFlag
 	nrequests := intFlag{value: 1000, set: false}
+	fanout := intFlag{value:-1, set: false}
 
 	flags := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	flags.Var(&duration, "duration", "Test duration in seconds")
 	flags.Var(&nrequests, "requests", "Total number of requests")
+	flags.Var(&fanout, "fanout", "Total number of unique fanout copies")
 
 	var concurrency = flags.Int("concurrency", 1, "Maximum concurrent requests (0=scan concurrency, run with ulimit -n 16384)")
 	var osize = flags.Int64("size", 30*1024, "Object size. Note that s3tester is not ideal for very large objects as the entire body must be read for v4 signing and the aws sdk does not support v4 chunked. Performance may degrade as size increases due to the use of v4 signing without chunked support")
@@ -176,6 +179,20 @@ func parse(cmdline []string) (parameters, error) {
 
 	if nrequests.set && nrequests.value <= 0 {
 		return parameters{}, errors.New("Number of requests must be > 0")
+	}
+
+	if fanout.set {
+		if *optype == "put"{
+			if !(1 <= fanout.value && fanout.value <= 10000){
+				return parameters{}, errors.New("Value of fanout for PUT operation must be between 1 and 10,000")
+			}
+		} else if *optype == "get"{
+			if !(0 <= fanout.value && fanout.value <= 9999){
+				return parameters{}, errors.New("Value of fanout for GET operation must be between 0 and 9,999")
+			}
+		} else {
+			return parameters{}, errors.New("Fanout is (currently) only supported in GET or PUT operations")
+		}
 	}
 
 	if *concurrency <= 0 {
@@ -313,6 +330,7 @@ func parse(cmdline []string) (parameters, error) {
 		days:               *days,
 		profile:            *profile,
 		nosign:             *nosign,
+		fanout:             &fanout,
 	}
 
 	return args, nil
