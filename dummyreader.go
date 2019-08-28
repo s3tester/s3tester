@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
+	"math/rand"
 )
 
 // For performance reasons we need to generate data in blocks as opposed to one character at a time. This is especially true
@@ -13,6 +15,9 @@ import (
 //
 // This MUST be a power of two to allow for fast modulo optimizations.
 const objectDataBlockSize = 4096
+
+// characters for random strings
+var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 // implements io.ReadSeeker
 type DummyReader struct {
@@ -117,11 +122,23 @@ func generateDataFromKey(key string, numBytes int) []byte {
 	data := make([]byte, 0, numBytes)
 
 	repeat := numBytes / keylen
-	data = append(data, []byte(strings.Repeat(key, repeat))...)
-
+	rand.Seed(time.Now().UnixNano())
+	for i := 0; i < repeat ; i++ {
+		data = append(data, []byte(randSeq(keylen))...)
+	}
+	
 	// Generate the remaining substring < keylen
 	remainder := key[:numBytes%keylen]
 	data = append(data, []byte(remainder)...)
 
 	return data
+}
+
+
+func randSeq(n int) string {
+    b := make([]rune, n)
+    for i := range b {
+        b[i] = letters[rand.Intn(len(letters))]
+    }
+    return string(b)
 }
