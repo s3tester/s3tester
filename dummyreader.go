@@ -121,11 +121,10 @@ func generateDataFromKey(key string, numBytes int) []byte {
 
 	data := make([]byte, 0, numBytes)
 
-	repeat := numBytes / keylen
+	//repeat := numBytes / keylen
 	rand.Seed(time.Now().UnixNano())
-	for i := 0; i < repeat ; i++ {
-		data = append(data, []byte(randSeq(keylen))...)
-	}
+	data = append(data, []byte(randSeq(numBytes))...)
+	
 	
 	// Generate the remaining substring < keylen
 	remainder := key[:numBytes%keylen]
