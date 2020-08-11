@@ -12,6 +12,8 @@ This tool is in active development - please submit feature requests in the issue
 # Installation
 
 	$ go get github.com/s3tester/s3tester
+	
+	Alternatively download the compiled version of s3tester for Windows or Linux: github.com/s3tester/s3tester/releases
 
 ## Minimum Requirements
 	
