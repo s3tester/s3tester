@@ -67,7 +67,7 @@ Usage of ./s3tester:
     -overwrite int
         Turns a PUT/GET/HEAD into an operation on the same s3 key. (1=all writes/reads are to same object, 2=threads clobber each other but each write/read is to unique objects).
     -partsize int
-        Size of each part (min 5MiB); only has an effect when a multipart put is used (default 5242880)
+        Size of each part (in bytes, min 5MiB); only has an effect when a multipart put is used (default 5242880)
     -prefix string
         object name prefix (default "testobject")
     -profile string
@@ -89,7 +89,7 @@ Usage of ./s3tester:
     -rr
         Reduced redundancy storage for PUT requests
     -size int
-        Object size. Note that s3tester is not ideal for very large objects as the entire body must be read for v4 signing and the aws sdk does not support v4 chunked. Performance may degrade as size increases due to the use of v4 signing without chunked support (default 30720)
+        Object size in bytes. Note that s3tester is not ideal for very large objects as the entire body must be read for v4 signing and the aws sdk does not support v4 chunked. Performance may degrade as size increases due to the use of v4 signing without chunked support (default 30720)
     -tagging string
         The tag-set for the object. The tag-set must be formatted as such: 'tag1=value1&tage2=value2'. Used for put, puttagging, putget and putget9010r.
     -tier string
