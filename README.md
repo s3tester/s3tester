@@ -76,7 +76,7 @@ $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 ```raw
 {
 	"mixedWorkload": [{
-		"operation": "put",
+		"operationType": "put",
 		"ratio": 25
 	}, {
 		"operationType": "get",
@@ -106,7 +106,7 @@ $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 ```
 
 - Starts writing objects into the default bucket `test`.
-- The bucket needs to be created from the Tenant Admin CLI or otherwise prior to running s3tester.
+- The bucket needs to be created prior to running s3tester.
 - The naming of the ingested objects will be `3-object#` where `3` is the prefix specified and `object#` is a sequential number starting from zero and going to the number of requests.
 - This command will perform a total of 20,000 PUT requests (or in this case slightly less because 20,000 does not divide by 128).
 - The object size is 20,000,000 bytes.
