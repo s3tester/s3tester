@@ -45,7 +45,7 @@ func TestRead(t *testing.T) {
 	}
 }
 
-// Ensure we get EOF when reading past the end.
+// TestReadEOF ensures we get EOF when reading past the end.
 func TestReadEOF(t *testing.T) {
 	data := "end"
 	d := NewDummyReader(int64(len(data)), data)
@@ -61,7 +61,7 @@ func TestReadEOF(t *testing.T) {
 	}
 }
 
-// Read multiple blocks of Data
+// TestReadMultipleBlocks reads multiple blocks of Data
 func TestReadMultipleBlocks(t *testing.T) {
 	data := "block"
 	d := NewDummyReader(2*int64(len(data)), data)
@@ -85,7 +85,7 @@ func TestReadMultipleBlocks(t *testing.T) {
 
 }
 
-// Read multiple blocks of Data
+// TestReadMultipleUnalignedBlocks reads multiple unaligned blocks of Data
 func TestReadMultipleUnalignedBlocks(t *testing.T) {
 	data := "abc"
 	d := NewDummyReader(3*int64(len(data)), data)
@@ -134,14 +134,13 @@ func TestGenerateData(t *testing.T) {
 	}
 }
 
-///// BENCHMARKS /////
 func BenchmarkGenerateData(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		generateDataFromKey("object-1-key", 4096)
 	}
 }
 
-// Read 1MiB on every iteration
+// BenchmarkReadData reads 1MiB on every iteration
 func BenchmarkReadData(b *testing.B) {
 	var size int64 = 1024 * 1024
 

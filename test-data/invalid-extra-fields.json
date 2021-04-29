@@ -1,0 +1,13 @@
+{
+    "global": {
+        "requests": 100,
+        "extra field": ""
+    },
+    "workload": [
+        {
+            "requests": 1000,
+            "extra field": ""
+        }
+    ],
+    "extra field": ""
+}

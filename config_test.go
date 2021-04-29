@@ -1,165 +1,242 @@
 package main
 
 import (
-	"golang.org/x/time/rate"
+	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"testing"
+
+	"golang.org/x/time/rate"
 )
 
+func generateValidCmdlineSetting(toAdds ...string) []string {
+	defaultCmdlineSetting := []string{}
+	for _, toAdd := range toAdds {
+		defaultCmdlineSetting = append(defaultCmdlineSetting, toAdd)
+	}
+	return defaultCmdlineSetting
+}
+
+func getArgs(config *Config) Parameters {
+	if len(config.worklist) == 1 {
+		return config.worklist[0]
+	}
+	return Parameters{}
+}
+
+func TestParametersMerge(t *testing.T) {
+	p := Parameters{}
+	fields := map[string]interface{}{}
+	fields["operation"] = "put"
+	fields["bucket"] = "bucket"
+	err := p.Merge(fields, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Operation != "put" {
+		t.Fatal()
+	}
+	if p.Bucket != "bucket" {
+		t.Fatal()
+	}
+}
+
+func TestParametersMergeNilEmpty(t *testing.T) {
+	p := Parameters{}
+	err := p.Merge(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Merge(map[string]interface{}{}, []string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParametersMergeIgnore(t *testing.T) {
+	p := Parameters{}
+	fields := map[string]interface{}{}
+	fields["operation"] = "put"
+	ignore := []string{"operation", "invalid"}
+	err := p.Merge(fields, ignore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Operation != "" {
+		t.Fatal()
+	}
+	if len(fields) != 1 {
+		t.Fatal()
+	}
+}
+
+func CheckArgValidity(tb testing.TB, flagName string, argValidity map[string]bool) {
+	for flagValue, valid := range argValidity {
+		cmdline := generateValidCmdlineSetting(fmt.Sprintf("-%s=%s", flagName, flagValue))
+		_, err := parse(cmdline)
+		if !valid && err == nil {
+			tb.Fatalf("%s flag value %s is invalid, should fail", flagName, flagValue)
+		} else if valid && err != nil {
+			tb.Fatalf("%s flag value %s is valid, should not fail", flagName, flagValue)
+		}
+	}
+}
+
 func TestDefaultArgs(t *testing.T) {
-	args := parseAndValidate([]string{})
+	config, err := parse([]string{})
 
-	if args.concurrency != 1 {
-		t.Fatalf("wrong default concurrency: %v", args.concurrency)
+	// default tester settings
+	if err != nil {
+		t.Fatalf("should build a config with default settings")
 	}
 
-	if args.osize != 30*1024 {
-		t.Fatalf("wrong default osize: %v", args.osize)
+	if config.LogDetail != "" {
+		t.Fatalf("wrong default logdetail: %v", config.LogDetail)
 	}
 
-	if args.endpoints[0] != "https://127.0.0.1:18082" {
-		t.Fatalf("wrong default endpoint: %v", args.endpoints[0])
+	if config.Retries != 0 {
+		t.Fatalf("wrong default retries: %v", config.Retries)
+	}
+
+	if config.RetrySleep != 0 {
+		t.Fatalf("wrong default retrySleep: %v", config.RetrySleep)
+	}
+
+	// default worklist settings
+	if len(config.worklist) != 1 {
+		t.Fatalf("should only build one test")
+	}
+
+	args := getArgs(config)
+
+	if args.Size != 30*1024 {
+		t.Fatalf("wrong default size: %v", args.Size)
 	}
 
 	if len(args.endpoints) != 1 {
 		t.Fatalf("wrong default endpoint list size: %v", len(args.endpoints))
 	}
 
-	if args.optype != "put" {
-		t.Fatalf("wrong default optype: %v", args.optype)
+	if args.Operation != "put" {
+		t.Fatalf("wrong default operation: %v", args.Operation)
 	}
 
-	if args.bucketname != "test" {
-		t.Fatalf("wrong default bucketname: %s", args.bucketname)
+	if args.Prefix != "testobject" {
+		t.Fatalf("wrong default objectprefix: %v", args.Prefix)
 	}
 
-	if args.objectprefix != "testobject" {
-		t.Fatalf("wrong default objectprefix: %v", args.objectprefix)
+	if args.Tagging != "" {
+		t.Fatalf("wrong default tagging: %v", args.Tagging)
 	}
 
-	if args.tagging != "" {
-		t.Fatalf("wrong default tagging: %v", args.tagging)
-	}
-
-	if args.metadata != "" {
-		t.Fatalf("wrong default metadata: %v", args.metadata)
-	}
-
-	if args.logdetail != "" {
-		t.Fatalf("wrong default logdetail: %v", args.logdetail)
+	if args.Metadata != "" {
+		t.Fatalf("wrong default metadata: %v", args.Metadata)
 	}
 
 	if args.ratePerSecond != rate.Limit(math.MaxFloat64) {
 		t.Fatalf("wrong default maxRate: %v", args.ratePerSecond)
 	}
 
-	if args.objrange != "" {
-		t.Fatalf("wrong default objrange: %v", args.objrange)
+	if args.Range != "" {
+		t.Fatalf("wrong default objrange: %v", args.Range)
 	}
 
-	if args.consistencyControl != "" {
-		t.Fatalf("wrong default consistencyControl: %v", args.consistencyControl)
+	if args.Overwrite != 0 {
+		t.Fatalf("wrong default overwrite: %v", args.Overwrite)
 	}
 
-	if args.reducedRedundancy {
-		t.Fatalf("wrong default reducedRedundancy: %v", args.reducedRedundancy)
-	}
-
-	if args.overwrite != 0 {
-		t.Fatalf("wrong default overwrite: %v", args.overwrite)
-	}
-
-	if args.retries != 0 {
-		t.Fatalf("wrong default retries: %v", args.retries)
-	}
-
-	if args.retrySleep != 0 {
-		t.Fatalf("wrong default retrySleep: %v", args.retrySleep)
-	}
-
-	if args.lockstep {
-		t.Fatalf("wrong default lockstep: %v", args.lockstep)
+	if args.Lockstep {
+		t.Fatalf("wrong default lockstep: %v", args.Lockstep)
 	}
 
 	if args.attempts != 1 {
 		t.Fatalf("wrong default attempts: %v", args.attempts)
 	}
 
-	if args.region != "us-east-1" {
-		t.Fatalf("wrong default region: %v", args.region)
+	if args.Region != "us-east-1" {
+		t.Fatalf("wrong default region: %v", args.Region)
 	}
 
-	if args.partsize != 5*(1<<20) {
-		t.Fatalf("wrong default partsize: %v", args.partsize)
+	if args.PartSize != 5*(1<<20) {
+		t.Fatalf("wrong default partsize: %v", args.PartSize)
 	}
 
-	if args.verify != 0 {
-		t.Fatalf("wrong default verify: %v", args.verify)
+	if args.Verify != 0 {
+		t.Fatalf("wrong default verify: %v", args.Verify)
 	}
 
-	if args.nrequests.set {
-		t.Fatalf("args.nrequests should not be set by default")
-	}
-
-	if args.duration.set {
-		t.Fatalf("args.duration should not be set by default")
-	}
-
-	if args.nrequests.value != 1000 {
-		t.Fatalf("args.nrequests should be set by default to 1000 (%d)", args.nrequests.value)
-	}
-
-	if args.duration.set {
-		t.Fatalf("args.duration should not be set by default")
-	}
-
-	if args.tier != "standard" {
+	if args.Tier != "standard" {
 		t.Fatalf("wrong default restore tier")
 	}
 
-	if args.days != 1 {
+	if args.Days != 1 {
 		t.Fatalf("wrong default restore days")
 	}
 
-	if args.profile != "" {
+	if args.Profile != "" {
 		t.Fatalf("wrong default profile")
 	}
 
-	if args.nosign != false {
+	if args.NoSignRequest != false {
 		t.Fatalf("wrong default nosign")
 	}
 }
 
 func TestNonDefaultMetadata(t *testing.T) {
-	cmdline := []string{"-metadata=key=value"}
-	args, _ := parse(cmdline)
+	cmdline := generateValidCmdlineSetting("-metadata=key=value")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := getArgs(config)
 
-	if args.metadata != "key=value" {
-		t.Fatalf("wrong metadata: %s", args.metadata)
+	if args.Metadata != "key=value" {
+		t.Fatalf("wrong metadata: %s", args.Metadata)
 	}
 }
 
 func TestNonDefaultTagging(t *testing.T) {
-	cmdline := []string{"-tagging=key=value"}
-	args, _ := parse(cmdline)
-
-	if args.tagging != "key=value" {
-		t.Fatalf("wrong metadata: %s", args.metadata)
+	cmdline := generateValidCmdlineSetting("-tagging=key=value")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := getArgs(config)
+	if args.Tagging != "key=value" {
+		t.Fatalf("wrong metadata: %s", args.Metadata)
 	}
 }
 
-func TestNotAllowToSetDurationAndNumberRequests(t *testing.T) {
-	cmdline := []string{"-duration=1", "-requests=1"}
+func TestNotAllowDurationAndDeleteOps(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-duration=1", "-operation=delete")
 	_, err := parse(cmdline)
 
 	if err == nil {
-		t.Fatalf("duration and requests should not both be set")
+		t.Fatalf("duration and operation delete can not both be set")
+	}
+}
+
+func TestNotAllowDurationAndRequestAndUnsupportedOps(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-duration=1", "-requests=1", "-operation=put")
+	_, err := parse(cmdline)
+
+	if err == nil {
+		t.Fatalf("duration, request and operation put can not all be set")
+	}
+}
+
+func TestNotAllowDurationAndUnsupportedOps(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-duration=1", "-operation=get")
+	_, err := parse(cmdline)
+
+	if err == nil {
+		t.Fatalf("duration and operation get can not both be set without requests set")
 	}
 }
 
 func TestRepeatMustBeGreaterThanZero(t *testing.T) {
-	cmdline := []string{"-repeat=-1"}
+	cmdline := generateValidCmdlineSetting("-repeat=-1")
 	_, err := parse(cmdline)
 
 	if err == nil {
@@ -168,14 +245,14 @@ func TestRepeatMustBeGreaterThanZero(t *testing.T) {
 }
 
 func TestConcurrencyMustBeGreaterThanZero(t *testing.T) {
-	cmdline := []string{"-concurrency=0"}
+	cmdline := generateValidCmdlineSetting("-concurrency=0")
 	_, err := parse(cmdline)
 
 	if err == nil {
 		t.Fatalf("concurrency cannot be zero")
 	}
 
-	cmdline = []string{"-concurrency=-1"}
+	cmdline = generateValidCmdlineSetting("-concurrency=-1")
 	_, err = parse(cmdline)
 
 	if err == nil {
@@ -184,14 +261,14 @@ func TestConcurrencyMustBeGreaterThanZero(t *testing.T) {
 }
 
 func TestRequestsMustBeGreaterThanZero(t *testing.T) {
-	cmdline := []string{"-requests=0"}
+	cmdline := generateValidCmdlineSetting("-requests=0")
 	_, err := parse(cmdline)
 
 	if err == nil {
 		t.Fatalf("number of requests cannot be zero")
 	}
 
-	cmdline = []string{"-requests=-1"}
+	cmdline = generateValidCmdlineSetting("-requests=-1")
 	_, err = parse(cmdline)
 
 	if err == nil {
@@ -202,7 +279,7 @@ func TestRequestsMustBeGreaterThanZero(t *testing.T) {
 func TestTooSmallMultipartPartSizes(t *testing.T) {
 	partsize := 5 * (1 << 20)
 	partsize = partsize - 100
-	cmdline := []string{"-operation=multipartput", "-partsize=" + strconv.Itoa(partsize)}
+	cmdline := generateValidCmdlineSetting("-operation=multipartput", "-partsize="+strconv.Itoa(partsize))
 	_, err := parse(cmdline)
 
 	if err == nil {
@@ -213,7 +290,7 @@ func TestTooSmallMultipartPartSizes(t *testing.T) {
 func TestTooManyMultipartParts(t *testing.T) {
 	partsize := 5 * (1 << 20)
 	size := partsize * 10001
-	cmdline := []string{"-operation=multipartput", "-partsize=" + strconv.Itoa(partsize), "-size=" + strconv.Itoa(size)}
+	cmdline := generateValidCmdlineSetting("-operation=multipartput", "-partsize="+strconv.Itoa(partsize), "-size="+strconv.Itoa(size))
 	_, err := parse(cmdline)
 
 	if err == nil {
@@ -222,7 +299,7 @@ func TestTooManyMultipartParts(t *testing.T) {
 }
 
 func TestRetriesMustBeGreaterThanEqualZero(t *testing.T) {
-	cmdline := []string{"-retries=-1"}
+	cmdline := generateValidCmdlineSetting("-retries=-1")
 	_, err := parse(cmdline)
 
 	if err == nil {
@@ -231,7 +308,7 @@ func TestRetriesMustBeGreaterThanEqualZero(t *testing.T) {
 }
 
 func TestInvalidOperation(t *testing.T) {
-	cmdline := []string{"-operation=fakeop"}
+	cmdline := generateValidCmdlineSetting("-operation=fake")
 	_, err := parse(cmdline)
 
 	if err == nil {
@@ -239,53 +316,72 @@ func TestInvalidOperation(t *testing.T) {
 	}
 }
 
-func TestInvalidConsistency(t *testing.T) {
-	cmdline := []string{"-consistency=fake"}
-	_, err := parse(cmdline)
-
-	if err == nil {
-		t.Fatalf("invalid consistency should fail")
+func TestValidCustomHeader(t *testing.T) {
+	cmdline := []string{"-header=key1:val1", "-header=key2:val2", "-header=key2:val2"}
+	config, newErr := parse(cmdline)
+	if newErr != nil {
+		t.Fatalf("all endpoints and concurrencies should succeed")
+	}
+	args := getArgs(config)
+	if len(args.Header) != 2 { // overwrites one
+		t.Fatalf("wrong number of custom headers: %v", len(args.Header))
+	}
+	if args.Header["key1"] != "val1" {
+		t.Fatalf("wrong custom headers: %v", args.Header["key1"])
+	}
+	if args.Header["key2"] != "val2" {
+		t.Fatalf("wrong custom headers: %v", args.Header["key2"])
 	}
 }
 
-func TestValidConsistency(t *testing.T) {
-	cmdline := []string{"-consistency=all"}
-	_, err := parse(cmdline)
-
+func TestParseConcurrencyValue(t *testing.T) {
+	args := generateValidCmdlineSetting("-concurrency=1")
+	config, err := parse(args)
 	if err != nil {
-		t.Fatalf("all consistency should succeed")
+		t.Fatal("failed parsing concurrency value")
 	}
+	checkExpectInt(t, 1, config.worklist[0].Concurrency)
+}
+
+func TestConcurrencyValueValidity(t *testing.T) {
+	concurrencyValidity := map[string]bool{
+		"-123": false,
+		"-1":   false,
+		"0":    false,
+		"1":    true,
+		"123":  true,
+	}
+	CheckArgValidity(t, "concurrency", concurrencyValidity)
 }
 
 func TestValidEndpoint(t *testing.T) {
-	oneEndpoint := []string{"-endpoint=https://127.0.0.1:18082"}
+	oneEndpoint := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082")
 	_, err := parse(oneEndpoint)
 
 	if err != nil {
 		t.Fatalf("all endpoint should succeed")
 	}
 
-	twoEndpoint := []string{"-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082", "-concurrency=2"}
-	args, newErr := parse(twoEndpoint)
-
+	twoEndpoint := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082", "-concurrency=2")
+	config, newErr := parse(twoEndpoint)
 	if newErr != nil {
-		t.Fatalf("all endpoint should succeed")
+		t.Fatalf("All endpoints should succeed: %v", newErr)
 	}
-
+	args := getArgs(config)
 	if len(args.endpoints) != 2 {
 		t.Fatalf("should have 2 endpoints in the list")
 	}
 }
 
 func TestInvalidEndpoint(t *testing.T) {
-	oneEndpoint := []string{"-endpoint=test"}
+	oneEndpoint := generateValidCmdlineSetting("-endpoint=test")
 	_, err := parse(oneEndpoint)
 
 	if err == nil {
 		t.Fatalf("all endpoint should not succeed")
 	}
 
-	twoEndpoint := []string{"-endpoint=https://127.0.0.1:18082,test"}
+	twoEndpoint := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,test")
 	_, newErr := parse(twoEndpoint)
 
 	if newErr == nil {
@@ -293,44 +389,43 @@ func TestInvalidEndpoint(t *testing.T) {
 	}
 }
 
-func TestValidEndpointConcurrancy(t *testing.T) {
-	oneEndpoint := []string{"-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082", "-concurrency=10"}
-	args, err := parse(oneEndpoint)
-
-	if err != nil {
-		t.Fatalf("all endpoint & concurrancy should succeed")
+func TestValidEndpointConcurrency(t *testing.T) {
+	twoEndpoint := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082", "-concurrency=10")
+	config, newErr := parse(twoEndpoint)
+	if newErr != nil {
+		t.Fatalf("all endpoints and concurrencies should succeed")
 	}
-
+	args := getArgs(config)
 	if len(args.endpoints) != 2 {
 		t.Fatalf("should be 2")
 	}
 }
 
-func TestInvalidEndpointConcurrancy(t *testing.T) {
-	oneEndpoint := []string{"-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082", "-concurrency=9"}
+func TestInvalidEndpointConcurrency(t *testing.T) {
+	oneEndpoint := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082", "-concurrency=9")
 	_, err := parse(oneEndpoint)
 
 	if err == nil {
-		t.Fatalf("all endpoint & concurrancy should not succeed")
+		t.Fatalf("all endpoints and concurrencies should not succeed")
 	}
 
-	twoEndpoint := []string{"-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082"}
+	twoEndpoint := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082")
 	_, newErr := parse(twoEndpoint)
 
 	if newErr == nil {
-		t.Fatalf("default concurrancy should fail")
+		t.Fatalf("default concurrency should fail")
 	}
 }
 
 func TestDuplicateEndpoints(t *testing.T) {
-	hasDuplicatePass := []string{"-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082,https://127.0.0.2:18082", "-concurrency=10"}
+	hasDuplicatePass := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082,https://127.0.0.2:18082", "-concurrency=10")
 	_, hasDuplicateErr := parse(hasDuplicatePass)
 
 	if hasDuplicateErr == nil {
 		t.Fatalf("duplicate should fail")
 	}
 
-	hasDuplicateFail := []string{"-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082,https://127.0.0.2:18082", "-concurrency=9"}
+	hasDuplicateFail := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,https://127.0.0.2:18082,https://127.0.0.2:18082", "-concurrency=9")
 	_, hasDuplicateFailErr := parse(hasDuplicateFail)
 
 	if hasDuplicateFailErr == nil {
@@ -339,55 +434,54 @@ func TestDuplicateEndpoints(t *testing.T) {
 }
 
 func TestEndpointsWithWhiteSpace(t *testing.T) {
-	cmd := []string{"-endpoint=https://127.0.0.1:18082,      https://127.0.0.2:18082", "-concurrency=10"}
-	args, err := parse(cmd)
-
+	cmd := generateValidCmdlineSetting("-endpoint=https://127.0.0.1:18082,      https://127.0.0.2:18082", "-concurrency=10")
+	config, err := parse(cmd)
 	if err != nil {
 		t.Fatalf("white space should pass")
 	}
-
+	args := getArgs(config)
 	if len(args.endpoints) != 2 {
 		t.Fatalf("should be 2")
 	}
 }
 
 func TestValidTier(t *testing.T) {
-	cmdline := []string{"-tier=Standard"}
+	cmdline := generateValidCmdlineSetting("-tier=Standard")
 	_, err := parse(cmdline)
 
 	if err != nil {
 		t.Fatalf("valid restore tier should succeed")
 	}
 
-	cmdline = []string{"-tier=Bulk"}
+	cmdline = generateValidCmdlineSetting("-tier=Bulk")
 	_, err = parse(cmdline)
 
 	if err != nil {
 		t.Fatalf("valid restore tier should succeed")
 	}
 
-	cmdline = []string{"-tier=Expedited"}
+	cmdline = generateValidCmdlineSetting("-tier=Expedited")
 	_, err = parse(cmdline)
 
 	if err != nil {
 		t.Fatalf("valid restore tier should succeed")
 	}
 
-	cmdline = []string{"-tier=standard"}
+	cmdline = generateValidCmdlineSetting("-tier=standard")
 	_, err = parse(cmdline)
 
 	if err != nil {
 		t.Fatalf("valid restore tier should succeed")
 	}
 
-	cmdline = []string{"-tier=bulk"}
+	cmdline = generateValidCmdlineSetting("-tier=bulk")
 	_, err = parse(cmdline)
 
 	if err != nil {
 		t.Fatalf("valid restore tier should succeed")
 	}
 
-	cmdline = []string{"-tier=expedited"}
+	cmdline = generateValidCmdlineSetting("-tier=expedited")
 	_, err = parse(cmdline)
 
 	if err != nil {
@@ -396,7 +490,7 @@ func TestValidTier(t *testing.T) {
 }
 
 func TestInvalidTier(t *testing.T) {
-	cmdline := []string{"-tier=fake"}
+	cmdline := generateValidCmdlineSetting("-tier=fake")
 	_, err := parse(cmdline)
 
 	if err == nil {
@@ -405,7 +499,7 @@ func TestInvalidTier(t *testing.T) {
 }
 
 func TestValidDays(t *testing.T) {
-	cmdline := []string{"-days=5"}
+	cmdline := generateValidCmdlineSetting("-days=5")
 	_, err := parse(cmdline)
 
 	if err != nil {
@@ -414,7 +508,7 @@ func TestValidDays(t *testing.T) {
 }
 
 func TestInvalidDays(t *testing.T) {
-	cmdline := []string{"-days=0"}
+	cmdline := generateValidCmdlineSetting("-days=0")
 	_, err := parse(cmdline)
 
 	if err == nil {
@@ -423,10 +517,725 @@ func TestInvalidDays(t *testing.T) {
 }
 
 func TestProfileAndNosign(t *testing.T) {
-	cmdline := []string{"-profile=tester", "-no-sign-request"}
+	cmdline := generateValidCmdlineSetting("-profile=tester", "-no-sign-request")
 	_, err := parse(cmdline)
 
 	if err == nil {
 		t.Fatalf("invalid profile and nosign should fail")
+	}
+}
+
+func createWorkloadJSON(tb testing.TB, jsonName, jsonString string) {
+	tb.Helper()
+	file, err := os.Create(jsonName)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	fmt.Fprintf(file, jsonString)
+	file.Close()
+}
+
+func checkExpectInt(t *testing.T, expect, actual int) {
+	if expect != actual {
+		t.Fatalf("Expected: %d, Got: %d", expect, actual)
+	}
+}
+
+func checkExpectString(t *testing.T, expect, actual string) {
+	if expect != actual {
+		t.Fatalf("Expected: %s, Got: %s", expect, actual)
+	}
+}
+
+func TestValidWorkload(t *testing.T) {
+	workload := `{
+		"global": {
+			"concurrency": 100,
+			"requests": 600,
+			"bucket": "src",
+			"endpoint": "https://test.com",
+			"operation": "head"
+		},
+		"workload": [
+			{"operation": "put"},
+			{"operation": "get","requests": 500},
+			{"prefix":"test","wait":1,"operation": "delete","concurrency":200},
+			{}
+		]
+	}`
+	workloadFileName := "validWorkload.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-prefix=notTest", "-workload=" + workloadFileName})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+
+	if len(test.worklist) != 4 {
+		t.Fatalf("should have exactly 4 tasks")
+	}
+
+	// checking 1st task
+	checkExpectInt(t, 600, test.worklist[0].Requests)
+	checkExpectInt(t, 100, test.worklist[0].Concurrency)
+	checkExpectString(t, "src", test.worklist[0].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[0].endpoints[0])
+	checkExpectString(t, "put", test.worklist[0].Operation)
+	checkExpectString(t, "notTest", test.worklist[0].Prefix)
+	checkExpectInt(t, 0, test.worklist[0].Wait)
+
+	// checking 2nd task (perworkload priority applied)
+	checkExpectInt(t, 500, test.worklist[1].Requests)
+	checkExpectInt(t, 100, test.worklist[1].Concurrency)
+	checkExpectString(t, "src", test.worklist[1].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[1].endpoints[0])
+	checkExpectString(t, "get", test.worklist[1].Operation)
+	checkExpectString(t, "notTest", test.worklist[1].Prefix)
+
+	// checking 3rd task (cmdline priority applied)
+	checkExpectInt(t, 600, test.worklist[2].Requests)
+	checkExpectInt(t, 200, test.worklist[2].Concurrency)
+	checkExpectInt(t, 1, test.worklist[2].Wait)
+	checkExpectString(t, "src", test.worklist[2].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[2].endpoints[0])
+	checkExpectString(t, "delete", test.worklist[2].Operation)
+	checkExpectString(t, "notTest", test.worklist[2].Prefix)
+
+	// checking 4th task (global priority applied)
+	checkExpectInt(t, 600, test.worklist[3].Requests)
+	checkExpectInt(t, 100, test.worklist[3].Concurrency)
+	checkExpectString(t, "src", test.worklist[3].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[3].endpoints[0])
+	checkExpectString(t, "head", test.worklist[3].Operation)
+	checkExpectString(t, "notTest", test.worklist[3].Prefix)
+	checkExpectInt(t, 0, test.worklist[3].Wait)
+}
+
+func TestValidTemplatedWorkload(t *testing.T) {
+	workload := `{
+		"global": {
+			"concurrency": 100,
+			"requests": 600,
+			"bucket": "src",
+			"endpoint": "https://test.com",
+			"operation": "head"
+		},
+		"workload": [
+			{{range $i, $v := makeSlice "put" "get" "head" "delete"}}{{if ne $i 0}}{{","}}{{end}}{{print "{\"operation\": \"" $v "\"}"}}{{end}}
+		]
+	}`
+	workloadFileName := "validWorkload.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-prefix=notTest", "-workload=" + workloadFileName})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+
+	if len(test.worklist) != 4 {
+		t.Fatalf("should have exactly 4 tasks")
+	}
+
+	// checking 1st task
+	checkExpectInt(t, 600, test.worklist[0].Requests)
+	checkExpectInt(t, 100, test.worklist[0].Concurrency)
+	checkExpectString(t, "src", test.worklist[0].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[0].endpoints[0])
+	checkExpectString(t, "put", test.worklist[0].Operation)
+	checkExpectString(t, "notTest", test.worklist[0].Prefix)
+	checkExpectInt(t, 0, test.worklist[0].Wait)
+
+	// checking 2nd task (perworkload priority applied)
+	checkExpectInt(t, 600, test.worklist[1].Requests)
+	checkExpectInt(t, 100, test.worklist[1].Concurrency)
+	checkExpectString(t, "src", test.worklist[1].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[1].endpoints[0])
+	checkExpectString(t, "get", test.worklist[1].Operation)
+	checkExpectString(t, "notTest", test.worklist[1].Prefix)
+	checkExpectInt(t, 0, test.worklist[1].Wait)
+
+	// checking 3rd task (cmdline priority applied)
+	checkExpectInt(t, 600, test.worklist[2].Requests)
+	checkExpectInt(t, 100, test.worklist[2].Concurrency)
+	checkExpectString(t, "src", test.worklist[2].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[2].endpoints[0])
+	checkExpectString(t, "head", test.worklist[2].Operation)
+	checkExpectString(t, "notTest", test.worklist[2].Prefix)
+	checkExpectInt(t, 0, test.worklist[2].Wait)
+
+	// checking 4th task (global priority applied)
+	checkExpectInt(t, 600, test.worklist[3].Requests)
+	checkExpectInt(t, 100, test.worklist[3].Concurrency)
+	checkExpectString(t, "src", test.worklist[3].Bucket)
+	checkExpectString(t, "https://test.com", test.worklist[3].endpoints[0])
+	checkExpectString(t, "delete", test.worklist[3].Operation)
+	checkExpectString(t, "notTest", test.worklist[3].Prefix)
+	checkExpectInt(t, 0, test.worklist[3].Wait)
+}
+
+func TestInvalidTemplatedWorkload(t *testing.T) {
+	workload := `{
+		"global": {
+			"concurrency": 100,
+			"requests": 600,
+			"bucket": "src",
+			"endpoint": "https://test.com",
+			"operation": "head"
+		},
+		"workload": [
+			{{invalid}}
+		]
+	}`
+	workloadFileName := "validWorkload.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	_, err := parse([]string{"-prefix=notTest", "-workload=" + workloadFileName})
+	if err == nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkloadUsingBothRequestsAndDurationAndUnsupportedOps(t *testing.T) {
+	workload := `{
+		"global": {
+			"concurrency": 100,
+			"bucket": "src",
+			"requests": 600,
+			"endpoint": "https://test.com"
+		},
+		"workload": [
+			{"operation": "options", "duration":10}
+		]
+	}`
+	workloadFileName := "invalid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	_, err := parse([]string{"-workload=" + workloadFileName})
+	if err == nil {
+		t.Fatalf("workload using both requests and duration should fail with operation option")
+	}
+}
+
+func TestWorkloadUsingBothRequestsAndDurationAndAndSupportedOps(t *testing.T) {
+	workload := `{
+		"global": {
+			"concurrency": 100,
+			"bucket": "src",
+			"requests": 600,
+			"endpoint": "https://test.com"
+		},
+		"workload": [
+			{"operation": "get", "duration":10}
+		]
+	}`
+	workloadFileName := "validWorkload.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	_, err := parse([]string{"-workload=" + workloadFileName})
+	if err != nil {
+		t.Fatalf("workload using both requests and duration should not fail with operation get")
+	}
+}
+
+func TestWorkloadWithTwoEndpoints(t *testing.T) {
+	workload := `{
+		"global": {
+			"concurrency": 100,
+			"bucket": "src",
+			"requests": 600,
+			"endpoint": "https://test.com,https://test2.com"
+		},
+		"workload": [
+			{"operation": "options"}
+		]
+	}`
+	workloadFileName := "invalid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	if len(test.worklist) != 1 {
+		t.Fatalf("should have exactly 1 tasks")
+	}
+	checkExpectInt(t, 600, test.worklist[0].Requests)
+	checkExpectInt(t, 100, test.worklist[0].Concurrency)
+	checkExpectString(t, "src", test.worklist[0].Bucket)
+	checkExpectInt(t, 2, len(test.worklist[0].endpoints))
+	checkExpectString(t, "https://test.com", test.worklist[0].endpoints[0])
+	checkExpectString(t, "https://test2.com", test.worklist[0].endpoints[1])
+	checkExpectString(t, "options", test.worklist[0].Operation)
+}
+
+func TestCreateWorklistEmpty(t *testing.T) {
+	p := Parameters{}
+	data := `{}`
+	ignore := []string{}
+	w, err := createWorklist(p, []byte(data), ignore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w) != 0 {
+		t.Fatal()
+	}
+}
+
+func TestCreateWorklistWithNil(t *testing.T) {
+	p := Parameters{}
+	w, err := createWorklist(p, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w) != 0 {
+		t.Fatal()
+	}
+
+	data := `{}`
+	w, err = createWorklist(p, []byte(data), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w) != 0 {
+		t.Fatal()
+	}
+}
+
+func TestCreateWorklist(t *testing.T) {
+	p := Parameters{Tier: "standard", Days: 1}
+	w, err := createWorklist(p, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w) != 0 {
+		t.Fatal()
+	}
+
+	data := `{
+		"global": {
+			"concurrency": 8,
+			"bucket": "bucket",
+			"requests": 8,
+			"endpoint": "https://test.com"
+		},
+		"workload": [
+			{
+				"operation": "put",
+				"addressing-style": "path"
+			},
+			{
+				"operation": "delete",
+				"addressing-style": "virtual"
+			}
+		]
+	}`
+	w, err = createWorklist(p, []byte(data), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w) != 2 {
+		t.Fatalf("Expected %d worklists but found: %d", 2, len(w))
+	}
+
+	firstWorklist, secondWorklist := w[0], w[1]
+	if firstWorklist.Bucket != "bucket" {
+		t.Fatalf("Expected bucket name: %s but found: %s", "bucket", firstWorklist.Bucket)
+	}
+	if firstWorklist.Operation != "put" {
+		t.Fatalf("Expected operation: %s but found: %s", "put", firstWorklist.Operation)
+	}
+	if firstWorklist.AddressingStyle != "path" {
+		t.Fatalf("Expected addressing-style: %s but found: %s", "path", firstWorklist.AddressingStyle)
+	}
+
+	if secondWorklist.Bucket != "bucket" {
+		t.Fatalf("Expected bucket name: %s but found: %s", "bucket", secondWorklist.Bucket)
+	}
+	if secondWorklist.Operation != "delete" {
+		t.Fatalf("Expected operation: %s but found: %s", "put", secondWorklist.Operation)
+	}
+	if secondWorklist.AddressingStyle != "virtual" {
+		t.Fatalf("Expected addressing-style: %s but found: %s", "virtual", firstWorklist.AddressingStyle)
+	}
+}
+
+func TestWorkloadWithHeaders(t *testing.T) {
+	workload := ` {
+		"workload": [
+			{"header":
+				{
+					"header1":"value1",
+					"header2":"value2"
+				}
+			}
+		]
+	}`
+	workloadFileName := "valid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	args := test.worklist[0]
+	if len(test.worklist) != 1 {
+		t.Fatalf("should have exactly 1 tasks")
+	}
+	if len(args.Header) != 2 {
+		t.Fatalf("should have 2 headers")
+	}
+	checkExpectString(t, "value1", args.Header["header1"])
+	checkExpectString(t, "value2", args.Header["header2"])
+}
+
+func TestCmdlineWorkloadWithHeaders(t *testing.T) {
+	workload := ` {
+		"workload": [
+			{"header":
+				{
+					"header1":"value1",
+					"header2":"value2"
+				}
+			}
+		]
+	}`
+	workloadFileName := "valid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName, "-header=header:value", "-header=another-header:another-value"})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	args := test.worklist[0]
+	if len(test.worklist) != 1 {
+		t.Fatalf("should have exactly 1 tasks")
+	}
+	if len(args.Header) != 2 {
+		t.Fatalf("should have 2 headers")
+	}
+	checkExpectString(t, "value", args.Header["header"])
+	checkExpectString(t, "another-value", args.Header["another-header"])
+}
+
+func TestGlobalWorkloadWithHeaders(t *testing.T) {
+	workload := ` {
+		"global": {
+			"header": {
+				"header1":"value2",
+				"header2":"value1"
+			}
+		},
+		"workload": [
+			{"header":
+				{
+					"header1":"value1",
+					"header2":"value2"
+				}
+			}
+		]
+	}`
+	workloadFileName := "valid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	args := test.worklist[0]
+	if len(test.worklist) != 1 {
+		t.Fatalf("should have exactly 1 tasks")
+	}
+	if len(args.Header) != 2 {
+		t.Fatalf("should have 2 headers")
+	}
+	checkExpectString(t, "value1", args.Header["header1"])
+	checkExpectString(t, "value2", args.Header["header2"])
+}
+
+func TestGlobalWorkloadNotApplyWithHeaders(t *testing.T) {
+	workload := ` {
+		"global": {
+			"header": {
+				"header1":"value2",
+				"header2":"value1"
+			}
+		},
+		"workload": [
+			{"header":
+				{
+					"header1":"value1",
+					"header2":"value2"
+				}
+			},
+			{}
+		]
+	}`
+	workloadFileName := "valid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	if len(test.worklist) != 2 {
+		t.Fatalf("should have exactly 2 tasks")
+	}
+	args := test.worklist[0]
+	if len(args.Header) != 2 {
+		t.Fatalf("should have 2 headers")
+	}
+	checkExpectString(t, "value1", args.Header["header1"])
+	checkExpectString(t, "value2", args.Header["header2"])
+
+	args2 := test.worklist[1]
+	if len(args2.Header) != 2 {
+		t.Fatalf("should have 2 headers")
+	}
+	checkExpectString(t, "value2", args2.Header["header1"])
+	checkExpectString(t, "value1", args2.Header["header2"])
+}
+
+func TestReduceRedundancyBackwardsCompatibility(t *testing.T) {
+	workload := ` {
+		"workload": [
+			{"header":
+				{
+					"header1":"value1",
+					"header2":"value2"
+				}
+			}
+		]
+	}`
+	workloadFileName := "valid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName, "-rr=true"})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	args := test.worklist[0]
+	if len(test.worklist) != 1 {
+		t.Fatalf("should have exactly 1 tasks")
+	}
+	if len(args.Header) != 1 {
+		t.Fatalf("should have 1 headers")
+	}
+	checkExpectString(t, "REDUCED_REDUNDANCY", args.Header["x-amz-storage-class"])
+}
+
+func TestNoReduceRedundancyBackwardsCompatibility(t *testing.T) {
+	workload := ` {
+		"workload": [
+			{"header":
+				{
+					"header1":"value1",
+					"header2":"value2"
+				}
+			}
+		]
+	}`
+	workloadFileName := "valid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName, "-rr=false"})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	args := test.worklist[0]
+	if len(test.worklist) != 1 {
+		t.Fatalf("should have exactly 1 tasks")
+	}
+	if len(args.Header) != 2 {
+		t.Fatalf("should have 2 headers")
+	}
+	checkExpectString(t, "value1", args.Header["header1"])
+	checkExpectString(t, "value2", args.Header["header2"])
+}
+
+func TestConsistencyControlBackwardsCompatibility(t *testing.T) {
+	workload := ` {
+		"workload": [
+			{"header":
+				{
+					"header1":"value1",
+					"header2":"value2"
+				}
+			}
+		]
+	}`
+	workloadFileName := "valid.json"
+	createWorkloadJSON(t, workloadFileName, workload)
+	defer os.Remove(workloadFileName)
+	test, err := parse([]string{"-workload=" + workloadFileName, "-consistency=all"})
+	if err != nil {
+		t.Fatalf("valid workload should not fail %s", err)
+	}
+	args := test.worklist[0]
+	if len(test.worklist) != 1 {
+		t.Fatalf("should have exactly 1 tasks")
+	}
+	if len(args.Header) != 1 {
+		t.Fatalf("should have 1 headers")
+	}
+	checkExpectString(t, "all", args.Header["Consistency-Control"])
+}
+
+func TestInvalidConsistencyControlBackwardsCompatibility(t *testing.T) {
+	_, err := parse([]string{"-consistency=invalid"})
+	if err == nil {
+		t.Fatalf("invalid workload should fail %s", err)
+	}
+}
+
+func TestRandomRangeValidation(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-operation=get", "-range=\"bytes=0-10\"", "-random-range=0-10/1")
+	_, err := parse(cmdline)
+	if err.Error() != randomRangeWithRangeErr {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=put", "-random-range=0-10/1")
+	_, err = parse(cmdline)
+	if err == nil || err.Error() != randomRangeWithoutGetErr {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=11-10/1")
+	_, err = parse(cmdline)
+	if err == nil || err.Error() != randomRangeInvalidMinMaxErr {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=500-600/200")
+	_, err = parse(cmdline)
+	if err == nil || err.Error() != randomRangeInvalidSizeErr {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=0-10/12")
+	_, err = parse(cmdline)
+	if err == nil || err.Error() != randomRangeInvalidSizeErr {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=0-10/11")
+	_, err = parse(cmdline)
+	if err != nil {
+		t.Fatalf("Expected no error, but got: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=0-10/")
+	_, err = parse(cmdline)
+	if err == nil || err.Error() != randomRangeInvalidSizeErr {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=0-10")
+	_, err = parse(cmdline)
+	if err == nil || err.Error() != randomRangeInvalidFormat {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=0-0/100")
+	_, err = parse(cmdline)
+	if err == nil || err.Error() != randomRangeInvalidMinMaxErr {
+		t.Fatalf("invalid random-range should fail with error message: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-random-range=0-100/10")
+	var config *Config
+	config, err = parse(cmdline)
+	if err != nil {
+		t.Fatalf("Expected no error, but got: %s", err)
+	}
+
+	args := config.worklist[0]
+	if args.randomRangeMin != 0 {
+		t.Fatalf("Expected randomRangeMin: 0, but got: %d", args.randomRangeMin)
+	}
+	if args.randomRangeMax != 100 {
+		t.Fatalf("Expected randomRangeMax: 100, but got: %d", args.randomRangeMax)
+	}
+}
+
+func TestUniformDist(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-operation=get", "-uniformDist=1000-100000")
+	_, err := parse(cmdline)
+	if err != nil {
+		t.Fatalf("Expected no error, but got: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=put", "-uniformDist=1000-100000")
+	_, err = parse(cmdline)
+	if err != nil {
+		t.Fatalf("Expected no error, but got: %s", err)
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=delete", "-uniformDist=1000-100000")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to invalid operation type")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=put", "-uniformDist=-1000-100000")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to invalid range")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=put", "-uniformDist=100000-1000")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to invalid range")
+	}
+}
+
+func TestRangeValidation(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-operation=get", "-range=bytes=0-10", "-random-range=0-10/1")
+	_, err := parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to including both -range and -random-range")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=put", "-range=bytes=0-10")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to invalid operation type")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=11-10")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to invalid range")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=500-")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to missing RangeMax")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=-600")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to missing RangeMin")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-range=0-10")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to invalid range format")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=0-10, 20-30")
+	_, err = parse(cmdline)
+	if err == nil {
+		t.Fatalf("Expected command to fail due to invalid range format")
+	}
+
+	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=0-10")
+	_, err = parse(cmdline)
+	if err != nil {
+		t.Fatalf("Expected no err, but got %s", err)
 	}
 }
