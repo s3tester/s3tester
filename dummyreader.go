@@ -14,13 +14,14 @@ import (
 // This MUST be a power of two to allow for fast modulo optimizations.
 const objectDataBlockSize = 4096
 
-// implements io.ReadSeeker
+// DummyReader implements the io.ReadSeeker interface, returning data that simply repeats the value of 'data' until the size is met
 type DummyReader struct {
 	size   int64
 	offset int64
 	data   *bytes.Reader
 }
 
+// NewDummyReader constructs an io.ReadSeeker compatible instance that will repeat the 'seed' string until 'size' is met
 func NewDummyReader(size int64, seed string) *DummyReader {
 	d := DummyReader{size: size}
 	data := generateDataFromKey(seed, objectDataBlockSize)
@@ -29,10 +30,12 @@ func NewDummyReader(size int64, seed string) *DummyReader {
 	return &d
 }
 
+// Size returns the total size of the data that DummyReader represents
 func (r *DummyReader) Size() int64 {
 	return r.size
 }
 
+// Read reads the data in the given buffer and returns the number of bytes read
 func (r *DummyReader) Read(p []byte) (n int, err error) {
 	dataLength := r.data.Size()
 
@@ -57,7 +60,10 @@ func (r *DummyReader) Read(p []byte) (n int, err error) {
 	// call as opposed to the naive approach of copying one byte in each iteration.
 	bytesTransferred := 0
 	for i := 0; i < read; i += bytesTransferred {
-		bytesTransferred, _ = r.data.Read(p[i:read])
+		bytesTransferred, err = r.data.Read(p[i:read])
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
 
 		if r.data.Len() == 0 {
 			r.data.Seek(0, io.SeekStart)
@@ -69,42 +75,45 @@ func (r *DummyReader) Read(p []byte) (n int, err error) {
 	return read, nil
 }
 
+// Seek updates the offset of the DummyReader based on a given offset and position
 func (r *DummyReader) Seek(offset int64, whence int) (int64, error) {
-	updateDummyDataOffset := func() {
+	updateDummyDataOffset := func() error {
 		if r.data != nil {
-			r.data.Seek(r.offset%r.data.Size(), io.SeekStart)
+			_, err := r.data.Seek(r.offset%r.data.Size(), io.SeekStart)
+			return err
 		}
+		return nil
 	}
 
 	switch whence {
 	case io.SeekStart:
 		if offset >= 0 && offset <= r.size {
 			r.offset = offset
-			updateDummyDataOffset()
-			return r.offset, nil
+			err := updateDummyDataOffset()
+			return r.offset, err
 		}
-		return r.offset, errors.New(fmt.Sprintf("SeekStart: Cannot seek past start or end of file. offset: %d, size: %d", offset, r.size))
+		return r.offset, fmt.Errorf("SeekStart: Cannot seek past start or end of file. offset: %d, size: %d", offset, r.size)
 	case io.SeekCurrent:
 		off := offset + r.offset
 		if off >= 0 && off <= r.size {
 			r.offset = off
-			updateDummyDataOffset()
-			return off, nil
+			err := updateDummyDataOffset()
+			return off, err
 		}
-		return r.offset, errors.New(fmt.Sprintf("SeekCurrent: Cannot seek past start or end of file. offset: %d, size: %d", off, r.size))
+		return r.offset, fmt.Errorf("SeekCurrent: Cannot seek past start or end of file. offset: %d, size: %d", off, r.size)
 	case io.SeekEnd:
 		off := r.size - offset
 		if off >= 0 && off <= r.size {
 			r.offset = off
-			updateDummyDataOffset()
-			return off, nil
+			err := updateDummyDataOffset()
+			return off, err
 		}
-		return r.offset, errors.New(fmt.Sprintf("SeekEnd: Cannot seek past start or end of file. offset: %d, size: %d", off, r.size))
+		return r.offset, fmt.Errorf("SeekEnd: Cannot seek past start or end of file. offset: %d, size: %d", off, r.size)
 	}
 	return 0, errors.New("Invalid value of whence")
 }
 
-// We need an efficient way to generate data for objects we write to s3. Ideally
+// generateDataFromKey is an efficient way to generate data for objects we write to s3. Ideally
 // this data is different for each object. This generates a block of data based
 // on the key passed in.
 func generateDataFromKey(key string, numBytes int) []byte {

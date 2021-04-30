@@ -1,0 +1,17 @@
+{
+  "global": {
+    "bucket": "test",
+    "concurrency": 4,
+    "prefix": "test",
+    "requests": 20
+  },
+  "workload": [
+    {{/* See https://golang.org/pkg/text/template/ for template syntax */}}
+    {{range $i, $v := makeSlice "put" "get" "head" "delete"}}
+      {{if ne $i 0}}
+        {{","}}
+      {{end}}
+      {{print `{"operation": "` $v `"}`}}
+    {{end}}
+  ]
+}

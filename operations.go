@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -9,42 +12,68 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
 
-func Options(hclient *http.Client, endpoint string) error {
+const (
+	directiveCopy    = "COPY"
+	directiveReplace = "REPLACE"
+)
+
+var (
+	rangeStartExp = regexp.MustCompile(`=(\d+)`)
+)
+
+// Options sends an http 'options' request to the specific endpoint
+func Options(client *http.Client, endpoint string) error {
 	req, err := http.NewRequest("OPTIONS", endpoint+"/", nil)
 	if err != nil {
-		log.Print("Creating OPTIONS request failed:", err)
+		log.Printf("Creating OPTIONS request failed: %v", err)
 		return err
 	}
 
-	resp, err := hclient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		log.Print("OPTIONS request failed:", err)
+		log.Printf("OPTIONS request failed: %v", err)
 		return err
 	}
+	if resp != nil {
+		defer resp.Body.Close()
+	}
 
-	io.Copy(ioutil.Discard, resp.Body)
-	resp.Body.Close()
+	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
+		log.Printf("OPTIONS request failed to read body: %v", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Options failed with status code: %d", resp.StatusCode)
+	}
 
 	return nil
 }
 
-func Put(svc s3iface.S3API, bucket, key, tagging, storageClass string, size int64, metadata map[string]*string) error {
+// Put performs an S3 PUT to the given bucket and key using the supplied configuration
+func Put(svc s3iface.S3API, bucket, key, tagging string, size int64, metadata map[string]*string) error {
 	obj := NewDummyReader(size, key)
+
+	hash, herr := calcMD5(obj)
+	if herr != nil {
+		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
+	}
 
 	params := &s3.PutObjectInput{
 		Bucket:        aws.String(bucket),
 		Key:           aws.String(key),
 		ContentLength: &size,
+		ContentMD5:    aws.String(hash),
 		Body:          obj,
-		StorageClass:  &storageClass,
 		Metadata:      metadata,
 	}
 
@@ -53,6 +82,25 @@ func Put(svc s3iface.S3API, bucket, key, tagging, storageClass string, size int6
 	}
 
 	_, err := svc.PutObject(params)
+
+	return err
+}
+
+// Copy performs an S3 PUT-Copy which copies the S3 object specified by the supplied key from copySourceBucket into destinationBucket
+func Copy(svc s3iface.S3API, copySourceBucket string, destinationBucket string, objectKey string,
+	tagging string, taggingDirective string, metadata map[string]*string, metadataDirective string) error {
+
+	params := &s3.CopyObjectInput{
+		Bucket:            aws.String(destinationBucket),
+		Key:               aws.String(objectKey),
+		CopySource:        aws.String(fmt.Sprintf("%s/%s", copySourceBucket, objectKey)),
+		Tagging:           aws.String(tagging),
+		TaggingDirective:  aws.String(taggingDirective),
+		Metadata:          metadata,
+		MetadataDirective: aws.String(metadataDirective),
+	}
+
+	_, err := svc.CopyObject(params)
 
 	return err
 }
@@ -67,7 +115,7 @@ func parseTags(tags string) s3.Tagging {
 		for index := range pairs {
 			keyvalue := strings.Split(pairs[index], "=")
 			if len(keyvalue) != 2 {
-				log.Fatal("Invalid tagging string supplied. Must be formatted like: 'tag1=value1&tage2=value2...'")
+				log.Fatal("Invalid tagging string supplied. Must be formatted like: 'tag1=value1&tag2=value2...'")
 			}
 			t := s3.Tag{
 				Key:   aws.String(keyvalue[0]),
@@ -80,6 +128,7 @@ func parseTags(tags string) s3.Tagging {
 	return s3Tags
 }
 
+// PutTagging updates the S3 tagset for the given S3 object specified by the supplied bucket and key
 func PutTagging(svc s3iface.S3API, bucket, key, tagging string) error {
 	tags := parseTags(tagging)
 
@@ -93,54 +142,76 @@ func PutTagging(svc s3iface.S3API, bucket, key, tagging string) error {
 	return err
 }
 
-func UpdateMetadata(svc s3iface.S3API, bucket, key string, metadata map[string]*string) error {
-	params := &s3.CopyObjectInput{
-		Bucket:            aws.String(bucket),
-		Key:               aws.String(key),
-		CopySource:        aws.String(bucket + "/" + key),
-		MetadataDirective: aws.String("REPLACE"),
-		Metadata:          metadata,
-	}
-	_, err := svc.CopyObject(params)
-
-	return err
+// UpdateMetadata updates the S3 user metadata for the given S3 object specified by the supplied bucket and key
+func UpdateMetadata(svc s3iface.S3API, bucket string, key string, metadata map[string]*string) error {
+	return Copy(svc, bucket, bucket, key, "", directiveCopy, metadata, directiveReplace)
 }
 
-func MultipartPut(svc s3iface.S3API, bucket, key, storageClass string, size, partSize int64, metadata map[string]*string) error {
+// calcMD5 calculates the MD5 for data read from the reader. If we ever care about x-amx-Content-Sha256 header then we'll need to add that.
+func calcMD5(r *DummyReader) (hash string, err error) {
+	if _, err = r.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+
+	defer func() {
+		_, err = r.Seek(0, io.SeekStart)
+	}()
+
+	h := md5.New()
+	if _, err = io.Copy(h, r); err != nil {
+		return "", err
+	}
+	hash = base64.StdEncoding.EncodeToString(h.Sum(nil))
+	return hash, nil
+}
+
+// MultipartPut initiates an S3 multipart upload for the given S3 object specified by the supplied bucket and key
+func MultipartPut(ctx context.Context, svc s3iface.S3API, bucket, key string, size, partSize int64, tagging string, metadata map[string]*string, sysInterruptHandler SyscallHandler) error {
 	// Because the object is uploaded in parts we need to generate part sized objects.
 	obj := NewDummyReader(partSize, key)
 
 	params := &s3.CreateMultipartUploadInput{
-		Bucket:       aws.String(bucket),
-		Key:          aws.String(key),
-		StorageClass: &storageClass,
-		Metadata:     metadata,
+		Bucket:   aws.String(bucket),
+		Key:      aws.String(key),
+		Metadata: metadata,
 	}
 
-	numparts := int64(math.Ceil(float64(size) / float64(partSize)))
+	if tagging != "" {
+		params.SetTagging(tagging)
+	}
+
+	numParts := int64(math.Ceil(float64(size) / float64(partSize)))
 
 	// this is for if the last part won't be the same size
 	lastobj := obj
-	if numparts != size/partSize {
-		lastobj = NewDummyReader(size-partSize*(numparts-1), key)
+	if numParts != size/partSize {
+		lastobj = NewDummyReader(size-partSize*(numParts-1), key)
 	}
 
 	var output *s3.CreateMultipartUploadOutput
-	output, err := svc.CreateMultipartUpload(params)
+	output, err := svc.CreateMultipartUploadWithContext(ctx, params)
 
 	if err == nil {
-		uploadId := output.UploadId
-		partdata := make([]*s3.CompletedPart, 0, numparts)
+		uploadID := output.UploadId
+		partdata := make([]*s3.CompletedPart, 0, numParts)
 
+		// log in-progress multipart upload so it can be aborted if a system interrupt occurs
+		sysInterruptHandler.addMultipartUpload(key, bucket, *uploadID)
+
+		hash, herr := calcMD5(obj)
+		if herr != nil {
+			return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
+		}
 		uparams := &s3.UploadPartInput{
 			Bucket:        aws.String(bucket),
 			Key:           aws.String(key),
 			ContentLength: &partSize,
+			ContentMD5:    aws.String(hash),
 			Body:          obj,
-			UploadId:      uploadId,
+			UploadId:      uploadID,
 		}
 
-		for partnum := int64(1); partnum <= numparts-1; partnum++ {
+		for partnum := int64(1); partnum <= numParts-1; partnum++ {
 			/* In a more realistic scenario we would want to upload parts concurrently,
 			   but concurrency is already one of the test options... might want to figure out
 			   if/how this should consider the concurrency option before adding concurrency here.
@@ -148,7 +219,7 @@ func MultipartPut(svc s3iface.S3API, bucket, key, storageClass string, size, par
 			uparams.SetPartNumber(partnum)
 
 			var uoutput *s3.UploadPartOutput
-			uoutput, err = svc.UploadPart(uparams)
+			uoutput, err = svc.UploadPartWithContext(ctx, uparams)
 			if err != nil {
 				break
 			}
@@ -167,12 +238,17 @@ func MultipartPut(svc s3iface.S3API, bucket, key, storageClass string, size, par
 		if err == nil {
 			uparams.SetBody(lastobj)
 			uparams.SetContentLength(lastobj.Size())
-			uparams.SetPartNumber(numparts)
+			uparams.SetPartNumber(numParts)
+			hash, herr := calcMD5(lastobj)
+			if herr != nil {
+				return fmt.Errorf("Calculating MD5 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
+			}
+			uparams.SetContentMD5(hash)
 			var uoutput *s3.UploadPartOutput
-			uoutput, err = svc.UploadPart(uparams)
+			uoutput, err = svc.UploadPartWithContext(ctx, uparams)
 			if err == nil {
 				part := &s3.CompletedPart{}
-				part.SetPartNumber(numparts)
+				part.SetPartNumber(numParts)
 				part.SetETag(*uoutput.ETag)
 				partdata = append(partdata, part)
 			}
@@ -182,35 +258,38 @@ func MultipartPut(svc s3iface.S3API, bucket, key, storageClass string, size, par
 			aparams := &s3.AbortMultipartUploadInput{
 				Bucket:   aws.String(bucket),
 				Key:      aws.String(key),
-				UploadId: uploadId,
+				UploadId: uploadID,
 			}
 			svc.AbortMultipartUpload(aparams)
 		} else {
 			cparams := &s3.CompleteMultipartUploadInput{
 				Bucket:   aws.String(bucket),
 				Key:      aws.String(key),
-				UploadId: uploadId,
+				UploadId: uploadID,
 			}
 
 			cpartdata := &s3.CompletedMultipartUpload{Parts: partdata}
 			cparams.SetMultipartUpload(cpartdata)
 
-			_, err = svc.CompleteMultipartUpload(cparams)
+			_, err = svc.CompleteMultipartUploadWithContext(ctx, cparams)
 		}
+		sysInterruptHandler.doneMultipartUpload(key, bucket, *uploadID)
 	}
-
 	return err
-
 }
 
-func Get(svc s3iface.S3API, bucket, key, byteRange string, verify int, partSize int64) (int64, error) {
+// Get performs an S3 GET for the S3 object specified by the supplied bucket and key
+func Get(svc s3iface.S3API, bucket, key, byteRange string, size int64, verify int, partSize int64) (int64, error) {
 	params := &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-		Range:  aws.String(byteRange),
 	}
 
-	out, err := identityGetObject(svc, params, verify, partSize)
+	if byteRange != "" {
+		params.Range = aws.String(byteRange)
+	}
+
+	out, err := identityGetObject(svc, params, verify, partSize, size)
 	if err != nil {
 		return 0, err
 	}
@@ -218,6 +297,7 @@ func Get(svc s3iface.S3API, bucket, key, byteRange string, verify int, partSize 
 	return *out.ContentLength, err
 }
 
+// Head performs an S3 HEAD for the S3 object specified by the supplied bucket and key
 func Head(svc s3iface.S3API, bucket, key string) error {
 	params := &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
@@ -229,6 +309,7 @@ func Head(svc s3iface.S3API, bucket, key string) error {
 	return err
 }
 
+// Delete performs an S3 delete for the S3 object specified by the supplied bucket and key
 func Delete(svc s3iface.S3API, bucket, key string) error {
 	params := &s3.DeleteObjectInput{
 		Bucket: aws.String(bucket),
@@ -255,64 +336,99 @@ func parseMetadataString(metaString string) map[string]*string {
 	return meta
 }
 
-// Retrieves objects from Amazon S3.
-func identityGetObject(c s3iface.S3API, input *s3.GetObjectInput, verify int, partsize int64) (output *s3.GetObjectOutput, err error) {
+// identityGetObject retrieves objects from an Amazon S3 HTTP interface
+func identityGetObject(c s3iface.S3API, input *s3.GetObjectInput, verify int, partsize int64, size int64) (output *s3.GetObjectOutput, err error) {
 	req, out := c.GetObjectRequest(input)
 	output = out
 	req.HTTPRequest.Header.Set("Accept-Encoding", "identity")
 	err = req.Send()
 	if err == nil && req.HTTPResponse.Body != nil {
+		defer func() {
+			io.Copy(ioutil.Discard, req.HTTPResponse.Body)
+			req.HTTPResponse.Body.Close()
+		}()
+
 		if verify == 0 {
 			_, err = io.Copy(ioutil.Discard, req.HTTPResponse.Body)
 			if err != nil {
 				err = fmt.Errorf("Error while reading body of %s/%s. %v", *input.Bucket, *input.Key, err)
 			}
 		} else {
-			key := []byte(*input.Key)
-			buffer := make([]byte, 1024)
-			index := 0
-			var read int
-			var readError error = nil
-			keylen := len(key)
-			// keep reading until we reach EOF (or some other error)
-		loop:
-			for readError == nil {
-				read, readError = req.HTTPResponse.Body.Read(buffer)
-				for i := 0; i < read; i++ {
-					//deal with the retrieved data that comes from multipartput data, which repeat every partsize bytes
-					if verify == 2 && int64(index) == partsize {
-						index = 0
-					}
-
-					// Due to the performance optimizations for generating object data in generateDataFromKey the offset when validating the data
-					// on the read path needs to be modulo the block size passed to generateDataFromKey. This is because the keys can get cut off
-					// at block boundaries and start at the first character at the beginning of a new block. So for a key "abcd" with a block size
-					// of 3, and a 9 byte object we get "abc|abc|abc" (| are block boundaries) instead of fully repeating keys "abcdabcda" which was the previous behaviour.
-					//
-					// This uses a modulo optimization for powers of 2. To ge the modulo some value x if x is a power of two you can use
-					// val & (x-1). In this case we are taking modulo objectDataBlockSize.
-					//
-					// We can further optimize this call by dealing with larger blocks as opposed to single characters but it's probably not worth it right now
-					// since this is a special non-performance path that validates all data read.
-					offset := (index & (objectDataBlockSize - 1)) % keylen
-
-					if buffer[i] != key[offset] {
-						readError = errors.New("Retrieved data different from expected")
-						break loop
-					}
-					index++
-				}
-			}
-
-			if readError != io.EOF {
-				err = readError
-			}
+			err = verifyGetData(req, input, verify, partsize, size)
 		}
-		req.HTTPResponse.Body.Close()
 	}
 	return
 }
 
+func verifyGetData(req *request.Request, input *s3.GetObjectInput, verify int, partsize int64, size int64) error {
+	key := []byte(*input.Key)
+	buffer := make([]byte, 1024)
+	index := 0
+	var read int
+	var readError error
+	keylen := len(key)
+
+	// check that the response length matches the expected object size before reading
+	if size != req.HTTPResponse.ContentLength {
+		return fmt.Errorf("Expected data with length=%d, but retrieved data with length=%d", size, req.HTTPResponse.ContentLength)
+	}
+
+	// get the starting index for range reads
+	if req.HTTPRequest.Header.Get("Range") != "" {
+		var err error
+		index, err = parseRange(req.HTTPRequest.Header.Get("Range"))
+		if err != nil {
+			return err
+		}
+		if verify == 2 {
+			index = index % int(partsize)
+		}
+	}
+
+	// keep reading until we reach EOF (or some other error)
+	for readError == nil {
+		read, readError = req.HTTPResponse.Body.Read(buffer)
+		for i := 0; i < read; i++ {
+			//deal with the retrieved data that comes from multipartput data, which repeat every partsize bytes
+			if verify == 2 && int64(index) == partsize {
+				index = 0
+			}
+
+			// Due to the performance optimizations for generating object data in generateDataFromKey the offset when validating the data
+			// on the read path needs to be modulo the block size passed to generateDataFromKey. This is because the keys can get cut off
+			// at block boundaries and start at the first character at the beginning of a new block. So for a key "abcd" with a block size
+			// of 3, and a 9 byte object we get "abc|abc|abc" (| are block boundaries) instead of fully repeating keys "abcdabcda" which was the previous behavior.
+			//
+			// This uses a modulo optimization for powers of 2. To ge the modulo some value x if x is a power of two you can use
+			// val & (x-1). In this case we are taking modulo objectDataBlockSize.
+			//
+			// We can further optimize this call by dealing with larger blocks as opposed to single characters but it's probably not worth it right now
+			// since this is a special non-performance path that validates all data read.
+			offset := (index & (objectDataBlockSize - 1)) % keylen
+
+			if buffer[i] != key[offset] {
+				return errors.New("Retrieved data different from expected")
+			}
+			index++
+		}
+	}
+
+	if readError != io.EOF {
+		return readError
+	}
+	return nil
+}
+
+// parseRange extracts the start of range (required) from an HTTP Range header
+func parseRange(s string) (int, error) {
+	matches := rangeStartExp.FindStringSubmatch(s)
+	if len(matches) != 2 {
+		return 0, fmt.Errorf("Range %q does not match required format", s)
+	}
+	return strconv.Atoi(matches[1])
+}
+
+// RestoreObject restores an archived copy of an object back into Amazon S3
 func RestoreObject(svc s3iface.S3API, bucket string, key string, tier string, days int64) error {
 	params := &s3.RestoreObjectInput{
 		Bucket: aws.String(bucket),
@@ -328,40 +444,34 @@ func RestoreObject(svc s3iface.S3API, bucket string, key string, tier string, da
 	return err
 }
 
-func DispatchOperation(svc s3iface.S3API, hclient *http.Client, op, keyName string, args *parameters, r *result, randMax int64) error {
+// DispatchOperation performs an S3 request based on the supplied arguments
+func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Client, op, keyName string, args *Parameters, r *Result, randMax int64, sysInterruptHandler SyscallHandler, debug bool) error {
 	var err error
-
-	sc := s3.StorageClassStandard
-	if args.reducedRedundancy {
-		sc = s3.StorageClassReducedRedundancy
-	}
 
 	switch op {
 	case "options":
-		if err = Options(hclient, r.Endpoint); err != nil {
-			r.Failcount++
-		}
+		err = Options(client, r.Endpoint)
 	case "put":
-		if err = Put(svc, args.bucketname, keyName, args.tagging, sc, args.osize, parseMetadataString(args.metadata)); err == nil {
-			r.sumObjSize += args.osize
+		if err = Put(svc, args.Bucket, keyName, args.Tagging, args.Size, parseMetadataString(args.Metadata)); err == nil {
+			r.TotalObjectSize += args.Size
 		}
 	case "puttagging":
-		err = PutTagging(svc, args.bucketname, keyName, args.tagging)
+		err = PutTagging(svc, args.Bucket, keyName, args.Tagging)
 	case "updatemeta":
-		err = UpdateMetadata(svc, args.bucketname, keyName, parseMetadataString(args.metadata))
+		err = UpdateMetadata(svc, args.Bucket, keyName, parseMetadataString(args.Metadata))
 	case "multipartput":
-		if err = MultipartPut(svc, args.bucketname, keyName, sc, args.osize, args.partsize, parseMetadataString(args.metadata)); err == nil {
-			r.sumObjSize += args.osize
+		if err = MultipartPut(ctx, svc, args.Bucket, keyName, args.Size, args.PartSize, args.Tagging, parseMetadataString(args.Metadata), sysInterruptHandler); err == nil {
+			r.TotalObjectSize += args.Size
 		}
 	case "get":
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(svc, args.bucketname, keyName, args.objrange, args.verify, args.partsize); err == nil {
-			r.sumObjSize += retrievedBytes
+		if retrievedBytes, err = Get(svc, args.Bucket, keyName, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
+			r.TotalObjectSize += retrievedBytes
 		}
 	case "head":
-		err = Head(svc, args.bucketname, keyName)
+		err = Head(svc, args.Bucket, keyName)
 	case "delete":
-		err = Delete(svc, args.bucketname, keyName)
+		err = Delete(svc, args.Bucket, keyName)
 	case "randget":
 		var objnum int64
 		if randMax <= 0 {
@@ -370,13 +480,16 @@ func DispatchOperation(svc s3iface.S3API, hclient *http.Client, op, keyName stri
 			objnum = rand.Int63n(randMax)
 		}
 
-		key := args.objectprefix + "-" + strconv.FormatInt(objnum, 10)
+		key := args.Prefix + "-" + strconv.FormatInt(objnum, 10)
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(svc, args.bucketname, key, args.objrange, args.verify, args.partsize); err == nil {
-			r.sumObjSize += retrievedBytes
+		if retrievedBytes, err = Get(svc, args.Bucket, key, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
+			r.TotalObjectSize += retrievedBytes
 		}
 	case "restore":
-		err = RestoreObject(svc, args.bucketname, keyName, args.tier, args.days)
+		err = RestoreObject(svc, args.Bucket, keyName, args.Tier, args.Days)
+	case "copy":
+		err = Copy(svc, args.CopySourceBucket, args.Bucket, keyName, args.Tagging, args.TaggingDirective,
+			parseMetadataString(args.Metadata), args.MetadataDirective)
 	}
 	return err
 }

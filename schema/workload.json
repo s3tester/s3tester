@@ -1,0 +1,108 @@
+{
+    "definitions": {
+        "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "bucket": {
+                    "type": "string"
+                },
+                "command-after": {
+                    "type": "string",
+                    "description": "Command to run after this step ends"
+                },
+                "command-before": {
+                    "type": "string",
+                    "description": "Command to run before this step begins"
+                },
+                "concurrency": {
+                    "type": "number"
+                },
+                "copy-source-bucket": {
+                    "type": "string",
+                    "description": "The name of the source bucket to use for copying objects"
+                },
+                "duration": {
+                    "type": "number"
+                },
+                "endpoint": {
+                    "type": "string"
+                },
+                "header": {
+                    "type": "object",
+                    "description": "HTTP header: value pairs"
+                },
+                "metadata": {
+                    "type": "string"
+                },
+                "metadata-directive": {
+                    "type": "string",
+                    "description": "Specifies whether the metadata is copied from the source object or if it is replaced with the metadata provided in the object copy request. Value must be one of 'COPY' or 'REPLACE'"
+                },
+                "noSignRequest": {
+                    "type": "boolean"
+                },
+                "operation": {
+                    "type": "string"
+                },
+                "partsize": {
+                    "type": "number"
+                },
+                "prefix": {
+                    "type": "string"
+                },
+                "profile": {
+                    "type": "string"
+                },
+                "query-params": {
+                    "type": "string"
+                },
+                "range": {
+                    "type": "string"
+                },
+                "ratelimit": {
+                    "type": "number"
+                },
+                "repeat": {
+                    "type": "number"
+                },
+                "requests": {
+                    "type": "number"
+                },
+                "size": {
+                    "type": "number"
+                },
+                "tagging": {
+                    "type": "string"
+                },
+                "tagging-directive": {
+                    "type": "string",
+                    "description": "Specifies whether the object tag-set is copied from the source object or if it is replaced with the tag-set provided in the object copy request. Value must be one of 'COPY' or 'REPLACE'"
+                },
+                "wait": {
+                    "type": "number",
+                    "description": "Wait X second(s) before executing this task"
+                }
+            }
+        }
+    },  
+    "type": "object",
+    "required": [
+        "workload"
+    ],
+    "additionalProperties": false,
+    "properties": {
+        "global": {
+            "$ref": "#/definitions/parameters",
+            "additionalProperties": false
+        },
+        "workload": {
+            "description": "Items in the array are run in sequence. Each item is a parameter object that specifies a single run",
+            "type": "array",
+            "items": {
+                "$ref": "#/definitions/parameters"
+            },
+            "additionalProperties": false
+        }
+    }
+}

@@ -1,44 +1,50 @@
 package main
 
 import (
-	"encoding/json"
+	// "encoding/json"
+	"bytes"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 )
 
 const (
-	bodyString = "hello"
-	bodyLength = int64(len(bodyString))
+	bodyString    = "hello"
+	bodyLength    = int64(len(bodyString))
+	xmlBodyString = `<CopyObjectResult>
+	<ETag>"a1a160470db7a1c3907e5152afa0b90c"</ETag>
+	<LastModified>2020-07-12T12:34:00.999999999Z</LastModified>
+</CopyObjectResult>`
 
 	accessKey string = "AWS_ACCESS_KEY_ID"
 	secretKey string = "AWS_SECRET_ACCESS_KEY"
 )
 
-func ResponseSuccessful(response *http.Response, err error) (success bool) {
-	success = err == nil
-	if success {
-		success = response.StatusCode >= 200 && response.StatusCode < 300
-	}
-	return
+func ResponseSuccessful(response *http.Response, err error) bool {
+	return err == nil && response.StatusCode >= 200 && response.StatusCode < 300
 }
 
 // A key to use for customizing per-request results
 type Request struct {
-	Uri    string
+	URI    string
 	Method string
 }
 
@@ -50,45 +56,91 @@ type Response struct {
 
 // A helper struct for stubbing out HTTP endpoints,
 // and collecting all received requests.
-type HttpHelper struct {
+type HTTPHelper struct {
+	mu               sync.RWMutex
 	Server           *httptest.Server
-	Requests         *[]*http.Request
-	Bodies           *[]string
-	Endpoint         string
-	perRequestResult *map[Request]Response // maps requests to results; for customizing server results on a per-request basis
+	requests         []*http.Request      // stores all the http requests received by this test server
+	bodies           []string             // stores all the request bodies received by this test server
+	perRequestResult map[Request]Response // maps requests to results; for customizing server results on a per-request basis
 }
 
-func (h *HttpHelper) Empty() bool {
-	return len(*h.Requests) == 0
+func (h *HTTPHelper) Endpoint() string {
+	return h.Server.URL
 }
 
-func (h *HttpHelper) Size() int {
-	return len(*h.Requests)
+func (h *HTTPHelper) Empty() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.requests) == 0
 }
 
-func (h *HttpHelper) NumBodies() int {
-	return len(*h.Bodies)
+func (h *HTTPHelper) Size() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.requests)
 }
 
-func (h *HttpHelper) NumRequests() int {
-	return len(*h.Requests)
+func (h *HTTPHelper) NumBodies() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.bodies)
 }
 
-func (h *HttpHelper) Request(index int) *http.Request {
-	return (*h.Requests)[index]
+func (h *HTTPHelper) NumRequests() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.requests)
 }
 
-func (h *HttpHelper) Body(index int) string {
-	return (*h.Bodies)[index]
+func (h *HTTPHelper) Request(index int) *http.Request {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.requests[index]
 }
 
-func (h *HttpHelper) SetRequestResult(req Request, res Response) {
-	(*h.perRequestResult)[req] = res
+func (h *HTTPHelper) Body(index int) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.bodies[index]
 }
 
-// Close all active goroutines
-// and perform cleanup of HttpHelper class.
-func (h *HttpHelper) Shutdown() {
+func (h *HTTPHelper) AppendRequest(req *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.requests = append(h.requests, req)
+}
+
+func (h *HTTPHelper) AppendBody(body string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.bodies = append(h.bodies, body)
+}
+
+func (h *HTTPHelper) RequestResult(req Request) (Response, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	r, ok := h.perRequestResult[req]
+	return r, ok
+}
+
+func (h *HTTPHelper) SetRequestResult(req Request, res Response) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.perRequestResult[req] = res
+}
+
+// RangeRequests invokes on f on each request received. Do not invoke other instance
+// methods of h in f() or they will deadlock.
+func (h *HTTPHelper) RangeRequests(f func(*http.Request)) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, req := range h.requests {
+		f(req)
+	}
+}
+
+// Shutdown closes all active goroutines and perform cleanup of HttpHelper class.
+func (h *HTTPHelper) Shutdown() {
 	h.Server.Close()
 }
 
@@ -97,45 +149,43 @@ func setValidAccessKeyEnv() {
 	os.Setenv(secretKey, "rFM0SP5t6na2WkU1Uk8LvIpEukqt/GJc8A/CphkD")
 }
 
-func NewHttpHelper(t *testing.T, getResponseBody string, headers map[string]string) HttpHelper {
-	// ensure envs that s3tester expects exist.
+func NewHTTPHelper(tb testing.TB, getResponseBody string, headers map[string]string) *HTTPHelper {
+	tb.Helper()
+	// ensure env that s3tester expects exists.
 	setValidAccessKeyEnv()
 
-	var reqs []*http.Request
-	var bodies []string
-	perRequestResult := make(map[Request]Response)
-	// some of the s3tester tests hit this handler concurrently;
-	// so need to handle concurrent updates to the reqs and bodies.
-
-	mutex := &sync.Mutex{}
+	helper := &HTTPHelper{perRequestResult: make(map[Request]Response)}
 	handle := http.NewServeMux()
 	handle.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		mutex.Lock()
-		defer mutex.Unlock()
-		reqs = append(reqs, r)
+		helper.AppendRequest(r)
 
 		s := ""
 		if r.Body != nil {
-			body, _ := ioutil.ReadAll(r.Body)
+			body, err := ioutil.ReadAll(r.Body)
+			if err != nil {
+				tb.Fatal(err)
+			}
 			s = string(body)
 		}
-		bodies = append(bodies, s)
+		helper.AppendBody(s)
 
-		if response, ok := perRequestResult[Request{Uri: r.URL.RequestURI(), Method: r.Method}]; ok {
+		if response, ok := helper.RequestResult(Request{URI: r.URL.RequestURI(), Method: r.Method}); ok {
 			for key, value := range response.Headers {
 				w.Header().Set(key, value)
 			}
 
 			w.WriteHeader(response.Status)
 			w.Write([]byte(response.Body))
-			return
 		}
 
 		for key, value := range headers {
 			w.Header().Set(key, value)
 		}
 
-		if r.Method == "GET" {
+		if r.Method == "GET" || r.Method == "POST" || (r.Method == "PUT" && len(getResponseBody) > 0) {
+			if _, ok := headers["Content-Length"]; !ok {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(getResponseBody)))
+			}
 			w.Write([]byte(getResponseBody))
 		} else {
 			w.WriteHeader(http.StatusNoContent)
@@ -145,25 +195,46 @@ func NewHttpHelper(t *testing.T, getResponseBody string, headers map[string]stri
 		w.WriteHeader(200)
 	})
 	ts := httptest.NewServer(handle)
-	return HttpHelper{Server: ts, Requests: &reqs, Bodies: &bodies, Endpoint: ts.URL, perRequestResult: &perRequestResult}
+	helper.Server = ts
+	return helper
 }
 
 type S3TesterHelper struct {
-	*HttpHelper
-	endpoints []*HttpHelper
-	args      parameters
+	*HTTPHelper
+	endpoints []*HTTPHelper
+	args      Parameters
+	config    *Config
 }
 
-func initS3TesterHelper(t *testing.T, op string) S3TesterHelper {
+func initS3TesterHelper(tb testing.TB, op string) S3TesterHelper {
+	tb.Helper()
 	emptyHeaders := make(map[string]string)
-	httpHelper := NewHttpHelper(t, bodyString, emptyHeaders)
-	return S3TesterHelper{HttpHelper: &httpHelper, args: testArgs(op, httpHelper.Endpoint)}
+	httpHelper := NewHTTPHelper(tb, bodyString, emptyHeaders)
+	config := testArgs(tb, op, httpHelper.Endpoint())
+	return S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
+}
+
+func initWorkloadTesterHelper(tb testing.TB, workload string) S3TesterHelper {
+	tb.Helper()
+	emptyHeaders := make(map[string]string)
+	httpHelper := NewHTTPHelper(tb, bodyString, emptyHeaders)
+	config := createTesterWithWorkload(tb, workload, httpHelper.Endpoint())
+	return S3TesterHelper{HTTPHelper: httpHelper, config: config}
+}
+
+func initMixedWorkloadTesterHelper(tb testing.TB) S3TesterHelper {
+	tb.Helper()
+	emptyHeaders := make(map[string]string)
+	httpHelper := NewHTTPHelper(tb, xmlBodyString, emptyHeaders)
+	config := createTesterWithMixedWorkload(tb, httpHelper.Endpoint())
+	return S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
 }
 
 func initS3TesterHelperWithData(t *testing.T, op, responseBody string) S3TesterHelper {
 	emptyHeaders := make(map[string]string)
-	httpHelper := NewHttpHelper(t, responseBody, emptyHeaders)
-	return S3TesterHelper{HttpHelper: &httpHelper, args: testArgs(op, httpHelper.Endpoint)}
+	httpHelper := NewHTTPHelper(t, responseBody, emptyHeaders)
+	config := testArgs(t, op, httpHelper.Endpoint())
+	return S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
 }
 
 func initMultiS3TesterHelper(t *testing.T, op string, endpoints int) S3TesterHelper {
@@ -172,17 +243,26 @@ func initMultiS3TesterHelper(t *testing.T, op string, endpoints int) S3TesterHel
 }
 
 func initMultiS3TesterHelperWithHeader(t *testing.T, op string, endpoints int, header map[string]string) S3TesterHelper {
+	return initMultiS3TesterHelperWithHeaderAndData(t, op, endpoints, header, bodyString)
+}
+
+func initMultiS3TesterHelperWithData(t *testing.T, op string, endpoints int, responseBody string) S3TesterHelper {
+	emptyHeaders := make(map[string]string)
+	return initMultiS3TesterHelperWithHeaderAndData(t, op, endpoints, emptyHeaders, responseBody)
+}
+
+func initMultiS3TesterHelperWithHeaderAndData(t *testing.T, op string, endpoints int, header map[string]string, responseBody string) S3TesterHelper {
 	endpointList := make([]string, endpoints)
-	httpHelperList := make([]*HttpHelper, endpoints)
+	httpHelperList := make([]*HTTPHelper, endpoints)
 	for i := 0; i < endpoints; i++ {
-		httpHelper := NewHttpHelper(t, bodyString, header)
-		httpHelperList[i] = &httpHelper
-		endpointList[i] = httpHelper.Endpoint
+		httpHelper := NewHTTPHelper(t, responseBody, header)
+		httpHelperList[i] = httpHelper
+		endpointList[i] = httpHelper.Endpoint()
 	}
-	tempArgs := testArgs(op, endpointList[0])
-	tempArgs.endpoints = endpointList
-	tempArgs.nrequests.value = endpoints
-	return S3TesterHelper{endpoints: httpHelperList, args: tempArgs}
+	config := testArgs(t, op, endpointList[0])
+	config.worklist[0].endpoints = endpointList
+	config.worklist[0].Requests = endpoints
+	return S3TesterHelper{endpoints: httpHelperList, config: config, args: config.worklist[0]}
 }
 
 func (h *S3TesterHelper) ShutdownMultiServer() {
@@ -193,14 +273,16 @@ func (h *S3TesterHelper) ShutdownMultiServer() {
 
 func (h *S3TesterHelper) runTesterWithoutValidation(t *testing.T) results {
 	setValidAccessKeyEnv()
-	_, testResults := runtest(h.args)
-	return testResults
+	syscallParams := NewSyscallParams(h.args)
+	defer syscallParams.detach()
+	return runtest(context.Background(), h.config, h.args, syscallParams)
 }
 
 func (h *S3TesterHelper) runTester(t *testing.T) results {
+	t.Helper()
 	testResults := h.runTesterWithoutValidation(t)
-	if testResults.CummulativeResult.Failcount > 0 {
-		t.Fatalf("Failed to run test. %d failures.", testResults.CummulativeResult.Failcount)
+	if testResults.CumulativeResult.Failcount > 0 {
+		t.Fatalf("Failed to run test. %d failures.", testResults.CumulativeResult.Failcount)
 	}
 
 	if h.Empty() {
@@ -208,43 +290,79 @@ func (h *S3TesterHelper) runTester(t *testing.T) results {
 	}
 
 	if h.NumBodies() != h.NumRequests() {
-		t.Fatalf("numBodies (%d, %v) does not match numRequests (%d, %v)", h.NumBodies(), h.Bodies, h.NumRequests(), h.Requests)
+		t.Fatalf("numBodies %d does not match numRequests %d", h.NumBodies(), h.NumRequests())
 	}
 
 	return testResults
 }
 
-func (helper *S3TesterHelper) runTesterWithMultiEndpoints(t *testing.T) results {
-	testResults := helper.runTesterWithoutValidation(t)
-	if testResults.CummulativeResult.Failcount > 0 {
-		t.Fatalf("Failed to run test. %d failures.", testResults.CummulativeResult.Failcount)
+func (h *S3TesterHelper) runTesterWithMultiEndpoints(t *testing.T) results {
+	testResults := h.runTesterWithoutValidation(t)
+	if testResults.CumulativeResult.Failcount > 0 {
+		t.Fatalf("Failed to run test. %d failures.", testResults.CumulativeResult.Failcount)
 	}
 
-	for _, h := range helper.endpoints {
-		if h.Empty() {
+	for _, endpoint := range h.endpoints {
+		if endpoint.Empty() {
 			t.Fatalf("Did not receive any requests")
 		}
 
-		if h.NumBodies() != h.NumRequests() {
-			t.Fatalf("numBodies (%d, %v) does not match numRequests (%d, %v)", h.NumBodies(), h.Bodies, h.NumRequests(), h.Requests)
+		if endpoint.NumBodies() != endpoint.NumRequests() {
+			t.Fatalf("numBodies %d does not match numRequests %d", endpoint.NumBodies(), endpoint.NumRequests())
 		}
 	}
 
 	return testResults
 }
 
-func testArgs(op string, endpoint string) (args parameters) {
-	nrequests := intFlag{value: 1, set: true}
+func createTesterWithWorkload(tb testing.TB, workload, endpoint string) *Config {
+	tb.Helper()
+	return createTesterRequiredJSON(tb, workload, []string{"-workload=file.json", "-endpoint=" + endpoint})
+}
 
-	args = parseAndValidate([]string{})
-	args.concurrency = 1
-	args.osize = 0
-	args.endpoints, _ = validateEndpoint(endpoint)
-	args.optype = op
-	args.bucketname = "test"
-	args.objectprefix = "object"
-	args.nrequests = &nrequests
-	return
+func createTesterWithMixedWorkload(tb testing.TB, endpoint string) *Config {
+	tb.Helper()
+	config, err := parse(generateValidCmdlineSetting("-requests=1", "-concurrency=1", "-size=0", "-bucket=test", "-prefix=object", "-mixed-workload=mixed-workload.json", "-endpoint="+endpoint))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return config
+}
+
+func createTesterRequiredJSON(tb testing.TB, content string, tags []string) *Config {
+	tb.Helper()
+	workloadFileName := "file.json"
+	createWorkloadJSON(tb, workloadFileName, content)
+	defer os.Remove(workloadFileName)
+	config, err := parse(tags)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return config
+}
+
+func createFile(tb testing.TB, fileName, fileContent string) *os.File {
+	file, err := os.Create(fileName)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	fmt.Fprintf(file, fileContent)
+	return file
+}
+
+func testArgs(tb testing.TB, op string, endpoint string) *Config {
+	tb.Helper()
+	cmdline := generateValidCmdlineSetting("-requests=1", "-concurrency=1", "-endpoint="+endpoint, "-operation="+op, "-bucket=test", "-prefix=object")
+	config, err := parse(cmdline)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	config.worklist[0].Concurrency = 1
+	config.worklist[0].Size = 0
+	config.worklist[0].Operation = op
+	config.worklist[0].Bucket = "test"
+	config.worklist[0].Prefix = "object"
+	return config
 }
 
 type s3XmlErrorResponse struct {
@@ -253,14 +371,20 @@ type s3XmlErrorResponse struct {
 	Message string   `xml:"Message"`
 }
 
-func generateErrorXml(code string) (response string) {
-	b, _ := xml.Marshal(s3XmlErrorResponse{Code: code, Message: code})
+func generateErrorXML(tb testing.TB, code string) (response string) {
+	tb.Helper()
+	b, err := xml.Marshal(s3XmlErrorResponse{Code: code, Message: code})
+	if err != nil {
+		tb.Fatal(err)
+	}
 	response = string(b)
 	return
 }
 
 func TestLoadAnonymousCredential(t *testing.T) {
-	cre, _ := loadCredentialProfile("", true)
+	cre, err := loadCredentialProfile("", true)
+	if err != nil {
+	}
 	if cre != credentials.AnonymousCredentials {
 		t.Fatalf("not standard anonymous credentials")
 	}
@@ -275,7 +399,10 @@ func TestLoadEnvCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error loading env credentials")
 	}
-	val, _ := cre.Get()
+	val, err := cre.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if val.AccessKeyID != testAccessKey || val.SecretAccessKey != testSecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
@@ -322,13 +449,19 @@ func TestLoadDefaultCredentialProfileFromFile(t *testing.T) {
 	fileContent := []byte("[default]\naws_access_key_id=" + testAccessKey + "\naws_secret_access_key=" + testSecretKey + "\n\n" + "[user1]\naws_access_key_id=" + user1AccessKey + "\naws_secret_access_key=" + user1SecretKey)
 	ioutil.WriteFile(fileName, fileContent, 0644)
 	defer os.Remove(fileName)
-	dir, _ := os.Getwd()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	os.Setenv("AWS_SHARED_CREDENTIALS_FILE", dir+"/"+fileName)
 	cre, err := loadCredentialProfile("", false)
 	if err != nil {
 		t.Fatalf("Error loading test file")
 	}
-	val, _ := cre.Get()
+	val, err := cre.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if val.AccessKeyID != testAccessKey || val.SecretAccessKey != testSecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
@@ -346,13 +479,19 @@ func TestLoadCredentialProfileFromFile(t *testing.T) {
 	fileContent := []byte("[default]\naws_access_key_id=" + testAccessKey + "\naws_secret_access_key=" + testSecretKey + "\n\n" + "[user1]\naws_access_key_id=" + user1AccessKey + "\naws_secret_access_key=" + user1SecretKey)
 	ioutil.WriteFile(fileName, fileContent, 0644)
 	defer os.Remove(fileName)
-	dir, _ := os.Getwd()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	os.Setenv("AWS_SHARED_CREDENTIALS_FILE", dir+"/"+fileName)
 	cre, err := loadCredentialProfile("user1", false)
 	if err != nil {
 		t.Fatalf("Error loading test file")
 	}
-	val, _ := cre.Get()
+	val, err := cre.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if val.AccessKeyID != user1AccessKey || val.SecretAccessKey != user1SecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
@@ -368,15 +507,26 @@ func TestMainWithGet(t *testing.T) {
 	logDetailFile := "test2"
 	logLatencyFile := "test3"
 	setValidAccessKeyEnv()
-	os.Args = []string{"nothing", "-operation=get", "-endpoint=" + h.Endpoint, "-requests=1", "-concurrency=1", "-bucket=test", "-prefix=object", "-json",
+	os.Args = []string{"nothing", "-operation=get", "-endpoint=" + h.Endpoint(), "-requests=1", "-concurrency=1", "-bucket=test", "-prefix=object", "-json",
 		"-logdetail=" + logDetailFile, "-loglatency=" + logLatencyFile, "-cpuprofile=" + cpuProfileFile}
 	defer os.Remove(cpuProfileFile)
 	defer os.Remove(logDetailFile)
 	defer os.Remove(logLatencyFile)
 
-	main()
+	config, err := parse(os.Args[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := executeTester(context.Background(), config)
+	failCount, err := handleTesterResults(config, results)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failCount > 0 {
+		t.Fatal(failCount)
+	}
 
-	// validate server recieved requests
+	// validate server received requests
 	if h.Request(0).Method != "GET" {
 		t.Fatalf("Wrong request type issued. Expected GET but got %s", h.Request(0).Method)
 	}
@@ -389,15 +539,6 @@ func TestMainWithGet(t *testing.T) {
 		t.Fatalf("Get should not have set Consistency-Control (actual: %s)", h.Request(0).Header.Get("Consistency-Control"))
 	}
 
-	// valiate locally generated files
-	if _, err := os.Stat(cpuProfileFile); os.IsNotExist(err) {
-		t.Fatalf("CPU profile file didn't create")
-	}
-
-	if _, err := os.Stat(logDetailFile); os.IsNotExist(err) {
-		t.Fatalf("Log detail file didn't create")
-	}
-
 	if _, err := os.Stat(logLatencyFile); os.IsNotExist(err) {
 		t.Fatalf("Log latency file didn't create")
 	}
@@ -406,9 +547,9 @@ func TestMainWithGet(t *testing.T) {
 func TestSingleEndpointOverwrite1(t *testing.T) {
 	h := initS3TesterHelper(t, "put")
 	defer h.Shutdown()
-	h.args.nrequests.value = 5
-	h.args.concurrency = 5
-	h.args.overwrite = 1
+	h.args.Requests = 5
+	h.args.Concurrency = 5
+	h.args.Overwrite = 1
 	testResults := h.runTester(t)
 
 	if h.Request(0).Method != "PUT" {
@@ -425,17 +566,17 @@ func TestSingleEndpointOverwrite1(t *testing.T) {
 		}
 	}
 
-	if testResults.CummulativeResult.UniqObjNum != 1 {
-		t.Fatalf("Expect only one unique object for overwrite=1, but got %d", testResults.CummulativeResult.UniqObjNum)
+	if testResults.CumulativeResult.UniqObjNum != 1 {
+		t.Fatalf("Expect only one unique object for overwrite=1, but got %d", testResults.CumulativeResult.UniqObjNum)
 	}
 }
 
 func TestSingleEndpointOverwrite2(t *testing.T) {
 	h := initS3TesterHelper(t, "put")
 	defer h.Shutdown()
-	h.args.nrequests.value = 5
-	h.args.concurrency = 5
-	h.args.overwrite = 2
+	h.args.Requests = 5
+	h.args.Concurrency = 5
+	h.args.Overwrite = 2
 	testResults := h.runTester(t)
 
 	if h.Request(0).Method != "PUT" {
@@ -452,8 +593,8 @@ func TestSingleEndpointOverwrite2(t *testing.T) {
 		}
 	}
 
-	if testResults.CummulativeResult.UniqObjNum != 1 {
-		t.Fatalf("Expect one unique object for overwrite=2, but got %d", testResults.CummulativeResult.UniqObjNum)
+	if testResults.CumulativeResult.UniqObjNum != 1 {
+		t.Fatalf("Expect one unique object for overwrite=2, but got %d", testResults.CumulativeResult.UniqObjNum)
 	}
 }
 
@@ -462,9 +603,9 @@ func TestMultiEndpointOverwrite1(t *testing.T) {
 	op := "put"
 	h := initMultiS3TesterHelper(t, op, endpoints)
 	defer h.ShutdownMultiServer()
-	h.args.nrequests.value = 10
-	h.args.concurrency = 10
-	h.args.overwrite = 1
+	h.args.Requests = 10
+	h.args.Concurrency = 10
+	h.args.Overwrite = 1
 	testResults := h.runTesterWithMultiEndpoints(t)
 
 	for _, h := range h.endpoints {
@@ -481,8 +622,8 @@ func TestMultiEndpointOverwrite1(t *testing.T) {
 		}
 	}
 
-	if testResults.CummulativeResult.UniqObjNum != 2 {
-		t.Fatalf("Expect 2 unique object for multiendpoint overwrite=1, but got %d", testResults.CummulativeResult.UniqObjNum)
+	if testResults.CumulativeResult.UniqObjNum != 1 {
+		t.Fatalf("Expect 1 unique object for multiendpoint overwrite=1, but got %d", testResults.CumulativeResult.UniqObjNum)
 	}
 }
 
@@ -491,27 +632,27 @@ func TestMultiEndpointOverwrite2(t *testing.T) {
 	op := "put"
 	h := initMultiS3TesterHelper(t, op, endpoints)
 	defer h.ShutdownMultiServer()
-	h.args.nrequests.value = 10
-	h.args.concurrency = 10
-	h.args.overwrite = 2
+	h.args.Requests = 8
+	h.args.Concurrency = 4
+	h.args.Overwrite = 2
 	testResults := h.runTesterWithMultiEndpoints(t)
 
 	for _, h := range h.endpoints {
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 4; i++ {
 			if h.Request(i).Method != "PUT" {
 				t.Fatalf("Wrong request type issued. Expected PUT but got %s", h.Request(i).Method)
 			}
 			if h.Request(i).Header.Get("Consistency-Control") != "" {
 				t.Fatalf("Get should not have set Consistency-Control (actual: %s)", h.Request(i).Header.Get("Consistency-Control"))
 			}
-			if h.Request(i).URL.Path != "/test/object-0" {
+			if h.Request(i).URL.Path != "/test/object-0" && h.Request(i).URL.Path != "/test/object-1" {
 				t.Fatalf("Wrong url path: %s", h.Request(i).URL.Path)
 			}
 		}
 	}
 
-	if testResults.CummulativeResult.UniqObjNum != 2 {
-		t.Fatalf("Expect 2 unique object for multiendpoint overwrite=2, but got %d", testResults.CummulativeResult.UniqObjNum)
+	if testResults.CumulativeResult.UniqObjNum != 2 {
+		t.Fatalf("Expect 2 unique objects for multiendpoint overwrite=2, but got %d", testResults.CumulativeResult.UniqObjNum)
 	}
 }
 
@@ -528,8 +669,8 @@ func TestGet(t *testing.T) {
 		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
 	}
 
-	if testResults.CummulativeResult.sumObjSize != bodyLength {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", bodyLength, testResults.CummulativeResult.sumObjSize)
+	if testResults.CumulativeResult.TotalObjectSize != bodyLength {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", bodyLength, testResults.CumulativeResult.TotalObjectSize)
 	}
 
 	if h.Request(0).Header.Get("Consistency-Control") != "" {
@@ -540,19 +681,27 @@ func TestGet(t *testing.T) {
 func TestGetWhenLessDataReturnedThanContentLength(t *testing.T) {
 	headers := make(map[string]string)
 	headers["Content-Length"] = "100"
-	httpHelper := NewHttpHelper(t, bodyString, headers)
-	h := S3TesterHelper{HttpHelper: &httpHelper, args: testArgs("get", httpHelper.Endpoint)}
+	httpHelper := NewHTTPHelper(t, bodyString, headers)
+	config := testArgs(t, "get", httpHelper.Endpoint())
+	h := S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
 	defer h.Shutdown()
 	testResults := h.runTesterWithoutValidation(t)
-	if testResults.CummulativeResult.Failcount != 1 {
-		t.Fatalf("Test should have failed. %d failures.", testResults.CummulativeResult.Failcount)
+	if testResults.CumulativeResult.Failcount != 1 {
+		t.Fatalf("Test should have failed. %d failures.", testResults.CumulativeResult.Failcount)
 	}
 }
 
-func TestGetWithConsistencyControl(t *testing.T) {
-	h := initS3TesterHelper(t, "get")
+func TestGetWithCustomHeader(t *testing.T) {
+	emptyHeaders := make(map[string]string)
+	httpHelper := NewHTTPHelper(t, bodyString, emptyHeaders)
+	cmdline := generateValidCmdlineSetting("-requests=1", "-concurrency=1", "-endpoint="+httpHelper.Endpoint(), "-operation=get", "-bucket=test", "-prefix=object", "-size=0",
+		"-header=Consistency-Control: all", "-header=abc:def", "-header=none:")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
 	defer h.Shutdown()
-	h.args.consistencyControl = "all"
 	h.runTester(t)
 
 	if h.Request(0).Method != "GET" {
@@ -564,7 +713,13 @@ func TestGetWithConsistencyControl(t *testing.T) {
 	}
 
 	if h.Request(0).Header.Get("Consistency-Control") != "all" {
-		t.Fatalf("Get should have set Consistency-Control (actual: %s)", h.Request(0).Header.Get("Consistency-Control"))
+		t.Fatalf("Get should have set custom header Consistency-Control (actual: %s)", h.Request(0).Header.Get("Consistency-Control"))
+	}
+	if h.Request(0).Header.Get("abc") != "def" {
+		t.Fatalf("Get should have set custom header value for abc to def (actual: %s)", h.Request(0).Header.Get("abc"))
+	}
+	if h.Request(0).Header.Get("none") != "" {
+		t.Fatalf("Get should have set custom header value for none to empty string (actual: %s)", h.Request(0).Header.Get("none"))
 	}
 }
 
@@ -574,7 +729,8 @@ func TestGetWithVerification(t *testing.T) {
 	for _, k := range keys {
 		h := initS3TesterHelperWithData(t, "get", k)
 		defer h.Shutdown()
-		h.args.verify = 1
+		h.args.Verify = 1
+		h.args.Size = int64(len(k))
 		testResults := h.runTester(t)
 
 		if h.Request(0).Method != "GET" {
@@ -585,12 +741,28 @@ func TestGetWithVerification(t *testing.T) {
 			t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
 		}
 
-		if testResults.CummulativeResult.sumObjSize != int64(len(k)) {
-			t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", bodyLength, testResults.CummulativeResult.sumObjSize)
+		if testResults.CumulativeResult.TotalObjectSize != int64(len(k)) {
+			t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", bodyLength, testResults.CumulativeResult.TotalObjectSize)
 		}
 
 		if h.Request(0).Header.Get("Consistency-Control") != "" {
 			t.Fatalf("Get should not have set Consistency-Control (actual: %s)", h.Request(0).Header.Get("Consistency-Control"))
+		}
+	}
+}
+
+func TestGetWithVerificationAndWrongSize(t *testing.T) {
+	keys := []string{"object-0", "object-", "o", "object-0object-0", "object-0object-"}
+
+	for _, k := range keys {
+		h := initS3TesterHelperWithData(t, "get", k)
+		defer h.Shutdown()
+		h.args.Verify = 1
+		h.args.Size = 5
+		testResults := h.runTesterWithoutValidation(t)
+
+		if testResults.CumulativeResult.Failcount != 1 {
+			t.Fatalf("Test should have failed. %d failures.", testResults.CumulativeResult.Failcount)
 		}
 	}
 }
@@ -623,10 +795,33 @@ func TestOptions(t *testing.T) {
 	}
 }
 
+func TestOptionsFailure(t *testing.T) {
+	h := initS3TesterHelper(t, "options")
+	defer h.Shutdown()
+
+	req := Request{URI: "/", Method: "OPTIONS"}
+	resp := Response{Body: "", Status: 500}
+	h.SetRequestResult(req, resp)
+
+	testResults := h.runTesterWithoutValidation(t)
+
+	if testResults.CumulativeResult.Failcount != 1 {
+		t.Fatalf("Expected 1 failure. %d failures.", testResults.CumulativeResult.Failcount)
+	}
+
+	if h.Request(0).Method != "OPTIONS" {
+		t.Fatalf("Wrong request type issued. Expected OPTIONS but got %s", h.Request(0).Method)
+	}
+
+	if h.Request(0).URL.Path != "/" {
+		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
+	}
+}
+
 func TestPut(t *testing.T) {
 	h := initS3TesterHelper(t, "put")
 	defer h.Shutdown()
-	h.args.osize = 6
+	h.args.Size = 6
 	testResults := h.runTester(t)
 
 	if h.Request(0).Method != "PUT" {
@@ -637,24 +832,23 @@ func TestPut(t *testing.T) {
 		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
 	}
 
-	if testResults.CummulativeResult.sumObjSize != 6 {
-		t.Fatalf("sumObjSize is wrong size. Expected 6, but got %d", testResults.CummulativeResult.sumObjSize)
+	if testResults.CumulativeResult.TotalObjectSize != 6 {
+		t.Fatalf("TotalObjectSize is wrong size. Expected 6, but got %d", testResults.CumulativeResult.TotalObjectSize)
 	}
 }
 
 func TestMultiplePuts(t *testing.T) {
 	h := initS3TesterHelper(t, "put")
 	defer h.Shutdown()
-	nrequests := intFlag{value: 5, set: true}
-	h.args.nrequests = &nrequests
-	h.args.osize = 6
+	h.args.Requests = 5
+	h.args.Size = 6
 	testResults := h.runTester(t)
 
 	if h.Size() != 5 {
 		t.Fatalf("Should be 5 requests (%d)", h.Size())
 	}
 
-	for i := 0; i < h.args.nrequests.value; i++ {
+	for i := 0; i < h.args.Requests; i++ {
 		if h.Request(i).Method != "PUT" {
 			t.Fatalf("Wrong request type issued. Expected PUT but got %s", h.Request(i).Method)
 		}
@@ -663,22 +857,20 @@ func TestMultiplePuts(t *testing.T) {
 		}
 	}
 
-	if testResults.CummulativeResult.sumObjSize != 30 {
-		t.Fatalf("sumObjSize is wrong size. Expected 30, but got %d", testResults.CummulativeResult.sumObjSize)
+	if testResults.CumulativeResult.TotalObjectSize != 30 {
+		t.Fatalf("TotalObjectSize is wrong size. Expected 30, but got %d", testResults.CumulativeResult.TotalObjectSize)
 	}
 
-	if testResults.CummulativeResult.UniqObjNum != 5 {
-		t.Fatalf("uniqObjNum is %d. Expected 5.", testResults.CummulativeResult.UniqObjNum)
+	if testResults.CumulativeResult.UniqObjNum != 5 {
+		t.Fatalf("uniqObjNum is %d. Expected 5.", testResults.CumulativeResult.UniqObjNum)
 	}
 }
 
 func TestMultiplePutsWithRepeat(t *testing.T) {
 	h := initS3TesterHelper(t, "put")
 	defer h.Shutdown()
-
-	nrequests := intFlag{value: 5, set: true}
-	h.args.nrequests = &nrequests
-	h.args.osize = 6
+	h.args.Requests = 5
+	h.args.Size = 6
 	h.args.attempts = 2 // uniqObjNum should still just be 5 even though we do each PUT twice
 	testResults := h.runTester(t)
 
@@ -686,7 +878,7 @@ func TestMultiplePutsWithRepeat(t *testing.T) {
 		t.Fatalf("Should be 10 requests (%d)", h.Size())
 	}
 
-	for i := 0; i < h.args.nrequests.value; i++ {
+	for i := 0; i < h.args.Requests; i++ {
 		if h.Request(i).Method != "PUT" {
 			t.Fatalf("Wrong request type issued. Expected PUT but got %s", h.Request(i).Method)
 		}
@@ -695,19 +887,19 @@ func TestMultiplePutsWithRepeat(t *testing.T) {
 		}
 	}
 
-	if testResults.CummulativeResult.sumObjSize != 60 {
-		t.Fatalf("sumObjSize is wrong size. Expected 60, but got %d", testResults.CummulativeResult.sumObjSize)
+	if testResults.CumulativeResult.TotalObjectSize != 60 {
+		t.Fatalf("TotalObjectSize is wrong size. Expected 60, but got %d", testResults.CumulativeResult.TotalObjectSize)
 	}
 
-	if testResults.CummulativeResult.UniqObjNum != 5 {
-		t.Fatalf("uniqObjNum is %d. Expected 5.", testResults.CummulativeResult.UniqObjNum)
+	if testResults.CumulativeResult.UniqObjNum != 5 {
+		t.Fatalf("uniqObjNum is %d. Expected 5.", testResults.CumulativeResult.UniqObjNum)
 	}
 
-	if testResults.CummulativeResult.Count != 10 {
-		t.Fatalf("count is %d. Expected 10.", testResults.CummulativeResult.Count)
+	if testResults.CumulativeResult.Count != 10 {
+		t.Fatalf("count is %d. Expected 10.", testResults.CumulativeResult.Count)
 	}
 
-	for i := 0; i < h.args.nrequests.value*h.args.attempts-2; i = i + 2 {
+	for i := 0; i < h.args.Requests*h.args.attempts-2; i = i + 2 {
 		if h.Body(i) != h.Body(i+1) {
 			t.Fatalf("wrong body for objects %d (%s) and %d (%s)", i, h.Body(i), i+1, h.Body(i+1))
 		}
@@ -717,9 +909,8 @@ func TestMultiplePutsWithRepeat(t *testing.T) {
 func TestConcurrentPuts(t *testing.T) {
 	h := initS3TesterHelper(t, "put")
 	defer h.Shutdown()
-	h.args.concurrency = 2
-	nrequests := intFlag{value: 2, set: true}
-	h.args.nrequests = &nrequests
+	h.args.Concurrency = 2
+	h.args.Requests = 2
 	h.runTester(t)
 
 	if h.Size() != 2 {
@@ -727,7 +918,7 @@ func TestConcurrentPuts(t *testing.T) {
 	}
 
 	foundPaths := []bool{false, false}
-	for i := 0; i < h.args.concurrency; i++ {
+	for i := 0; i < h.args.Concurrency; i++ {
 		if h.Request(i).Method != "PUT" {
 			t.Fatalf("Wrong request type issued. Expected PUT but got %s", h.Request(i).Method)
 		}
@@ -761,7 +952,7 @@ func TestDelete(t *testing.T) {
 func TestPutTagging(t *testing.T) {
 	h := initS3TesterHelper(t, "puttagging")
 	defer h.Shutdown()
-	h.args.tagging = "tag1=value1"
+	h.args.Tagging = "tag1=value1"
 	h.runTester(t)
 
 	if h.Request(0).Method != "PUT" {
@@ -802,9 +993,9 @@ func TestPutTagging(t *testing.T) {
 }
 
 func TestMetadataUpdate(t *testing.T) {
-	h := initS3TesterHelper(t, "updatemeta")
+	h := initS3TesterHelperWithData(t, "updatemeta", xmlBodyString)
 	defer h.Shutdown()
-	h.args.metadata = "key1=value1"
+	h.args.Metadata = "key1=value1"
 	h.runTester(t)
 
 	if h.Request(0).Method != "PUT" {
@@ -831,11 +1022,12 @@ func TestMetadataUpdate(t *testing.T) {
 func TestMultipartPut(t *testing.T) {
 	headers := make(map[string]string)
 	headers["ETag"] = "7e10e7d25dc4581d89b9285be5f384fd"
-	httpHelper := NewHttpHelper(t, bodyString, headers)
-	h := S3TesterHelper{HttpHelper: &httpHelper, args: testArgs("multipartput", httpHelper.Endpoint)}
-	h.args.partsize = 100
-	h.args.osize = 200
-	h.args.metadata = "key1=value1"
+	httpHelper := NewHTTPHelper(t, bodyString, headers)
+	config := testArgs(t, "multipartput", httpHelper.Endpoint())
+	h := S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
+	h.args.PartSize = 100
+	h.args.Size = 200
+	h.args.Metadata = "key1=value1"
 	defer h.Shutdown()
 
 	uid := "VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA"
@@ -847,7 +1039,7 @@ func TestMultipartPut(t *testing.T) {
 		  <Key>object-0</Key>
 		  <UploadId>VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA</UploadId>
 		</InitiateMultipartUploadResult>`
-	multipartInitiateReq := Request{Uri: "/test/object-0?uploads=", Method: "POST"}
+	multipartInitiateReq := Request{URI: "/test/object-0?uploads=", Method: "POST"}
 	multipartInitiateResponse := Response{Body: multipartInitiateBody, Status: 200}
 	h.SetRequestResult(multipartInitiateReq, multipartInitiateResponse)
 
@@ -859,7 +1051,7 @@ func TestMultipartPut(t *testing.T) {
 		  <Key>object-0</Key>
 		  <ETag>"3858f62230ac3c915f300c664312c11f-9"</ETag>
 		</CompleteMultipartUploadResult>`
-	multipartCompleteReq := Request{Uri: fmt.Sprintf("/test/object-0?uploadId=%s", uid), Method: "POST"}
+	multipartCompleteReq := Request{URI: fmt.Sprintf("/test/object-0?uploadId=%s", uid), Method: "POST"}
 	multipartCompleteResponse := Response{Body: multipartCompleteBody, Status: 200}
 	h.SetRequestResult(multipartCompleteReq, multipartCompleteResponse)
 
@@ -912,11 +1104,12 @@ func TestMultipartPut(t *testing.T) {
 func TestMultipartPutWithUnevenPartsize(t *testing.T) {
 	headers := make(map[string]string)
 	headers["ETag"] = "7e10e7d25dc4581d89b9285be5f384fd"
-	httpHelper := NewHttpHelper(t, bodyString, headers)
-	h := S3TesterHelper{HttpHelper: &httpHelper, args: testArgs("multipartput", httpHelper.Endpoint)}
-	h.args.partsize = 110
-	h.args.osize = 200
-	h.args.metadata = "key1=value1"
+	httpHelper := NewHTTPHelper(t, bodyString, headers)
+	config := testArgs(t, "multipartput", httpHelper.Endpoint())
+	h := S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
+	h.args.PartSize = 110
+	h.args.Size = 200
+	h.args.Metadata = "key1=value1"
 	defer h.Shutdown()
 
 	uid := "VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA"
@@ -928,7 +1121,7 @@ func TestMultipartPutWithUnevenPartsize(t *testing.T) {
 		  <Key>object-0</Key>
 		  <UploadId>VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA</UploadId>
 		</InitiateMultipartUploadResult>`
-	multipartInitiateReq := Request{Uri: "/test/object-0?uploads=", Method: "POST"}
+	multipartInitiateReq := Request{URI: "/test/object-0?uploads=", Method: "POST"}
 	multipartInitiateResponse := Response{Body: multipartInitiateBody, Status: 200}
 	h.SetRequestResult(multipartInitiateReq, multipartInitiateResponse)
 
@@ -940,7 +1133,7 @@ func TestMultipartPutWithUnevenPartsize(t *testing.T) {
 		  <Key>object-0</Key>
 		  <ETag>"3858f62230ac3c915f300c664312c11f-9"</ETag>
 		</CompleteMultipartUploadResult>`
-	multipartCompleteReq := Request{Uri: fmt.Sprintf("/test/object-0?uploadId=%s", uid), Method: "POST"}
+	multipartCompleteReq := Request{URI: fmt.Sprintf("/test/object-0?uploadId=%s", uid), Method: "POST"}
 	multipartCompleteResponse := Response{Body: multipartCompleteBody, Status: 200}
 	h.SetRequestResult(multipartCompleteReq, multipartCompleteResponse)
 
@@ -993,11 +1186,12 @@ func TestMultipartPutWithUnevenPartsize(t *testing.T) {
 func TestMultipartPutFailureCallsAbort(t *testing.T) {
 	headers := make(map[string]string)
 	headers["ETag"] = "7e10e7d25dc4581d89b9285be5f384fd"
-	httpHelper := NewHttpHelper(t, bodyString, headers)
-	h := S3TesterHelper{HttpHelper: &httpHelper, args: testArgs("multipartput", httpHelper.Endpoint)}
-	h.args.partsize = 100
-	h.args.osize = 200
-	h.args.metadata = "key1=value1"
+	httpHelper := NewHTTPHelper(t, bodyString, headers)
+	config := testArgs(t, "multipartput", httpHelper.Endpoint())
+	h := S3TesterHelper{HTTPHelper: httpHelper, config: config, args: config.worklist[0]}
+	h.args.PartSize = 100
+	h.args.Size = 200
+	h.args.Metadata = "key1=value1"
 	defer h.Shutdown()
 
 	uid := "VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA"
@@ -1009,17 +1203,17 @@ func TestMultipartPutFailureCallsAbort(t *testing.T) {
 		  <Key>object-0</Key>
 		  <UploadId>VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA</UploadId>
 		</InitiateMultipartUploadResult>`
-	multipartInitiateReq := Request{Uri: "/test/object-0?uploads=", Method: "POST"}
+	multipartInitiateReq := Request{URI: "/test/object-0?uploads=", Method: "POST"}
 	multipartInitiateResponse := Response{Body: multipartInitiateBody, Status: 200}
 	h.SetRequestResult(multipartInitiateReq, multipartInitiateResponse)
 
-	failedUploadPartReq := Request{Uri: fmt.Sprintf("/test/object-0?partNumber=1&uploadId=%s", uid), Method: "PUT"}
-	failedUploadPartResponse := Response{Body: generateErrorXml("BadRequest"), Status: 400}
+	failedUploadPartReq := Request{URI: fmt.Sprintf("/test/object-0?partNumber=1&uploadId=%s", uid), Method: "PUT"}
+	failedUploadPartResponse := Response{Body: generateErrorXML(t, "BadRequest"), Status: 400}
 	h.SetRequestResult(failedUploadPartReq, failedUploadPartResponse)
 
 	testResults := h.runTesterWithoutValidation(t)
-	if testResults.CummulativeResult.Failcount != 1 {
-		t.Fatalf("Should have failed to run test. %d failures.", testResults.CummulativeResult.Failcount)
+	if testResults.CumulativeResult.Failcount != 1 {
+		t.Fatalf("Should have failed to run test. %d failures.", testResults.CumulativeResult.Failcount)
 	}
 
 	// initiate, 1 part, abort
@@ -1058,15 +1252,14 @@ func TestMultipartPutFailureCallsAbort(t *testing.T) {
 
 func TestUniformPuts(t *testing.T) {
 	h := initS3TesterHelper(t, "put")
-	nrequest := intFlag{value: 10, set: true}
-	h.args.nrequests = &nrequest
+	h.args.Requests = 10
 	h.args.min = 10
 	h.args.max = 20
 	defer h.Shutdown()
 	testResults := h.runTester(t)
-	avgSize := float64(testResults.CummulativeResult.sumObjSize) / float64(testResults.CummulativeResult.Count)
-	if testResults.CummulativeResult.sumObjSize > 200 || testResults.CummulativeResult.sumObjSize < 100 {
-		t.Fatalf("sumObjectSize should be bounded by 100 to 200, but got %d", testResults.CummulativeResult.sumObjSize)
+	avgSize := float64(testResults.CumulativeResult.TotalObjectSize) / float64(testResults.CumulativeResult.Count)
+	if testResults.CumulativeResult.TotalObjectSize > 200 || testResults.CumulativeResult.TotalObjectSize < 100 {
+		t.Fatalf("sumObjectSize should be bounded by 100 to 200, but got %d", testResults.CumulativeResult.TotalObjectSize)
 	}
 	if avgSize < 10 || avgSize > 20 {
 		t.Fatalf("avgSize is wrong size. Expected between 10-20, but got %v", avgSize)
@@ -1102,12 +1295,12 @@ func runNormalMultiEndpointTest(t *testing.T, op string) {
 	endpoints := 2
 	h := initMultiS3TesterHelper(t, op, endpoints)
 	defer h.ShutdownMultiServer()
-	h.args.concurrency = 2
-	h.args.osize = 5
+	h.args.Concurrency = 2
+	h.args.Size = 5
 	testResults := h.runTesterWithMultiEndpoints(t)
 
-	if op != "delete" && op != "head" && op != "options" && testResults.CummulativeResult.sumObjSize != 2*5 {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", 2*5, testResults.CummulativeResult.sumObjSize)
+	if op != "delete" && op != "head" && op != "options" && testResults.CumulativeResult.TotalObjectSize != 2*5 {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", 2*5, testResults.CumulativeResult.TotalObjectSize)
 	}
 
 	for i, h := range h.endpoints {
@@ -1115,14 +1308,12 @@ func runNormalMultiEndpointTest(t *testing.T, op string) {
 			t.Fatalf("Wrong request type issued. Expected %s but got %s", strings.ToUpper(op), h.Request(0).Method)
 		}
 
-		if len(*h.Requests) != 1 {
-			t.Fatalf("Wrong request number. Expected %d but got %d", 1, len(*h.Requests))
+		if h.NumRequests() != 1 {
+			t.Fatalf("Wrong request number. Expected %d but got %d", 1, h.NumRequests())
 		}
 
 		if op != "options" && h.Request(0).URL.Path != "/test/object-"+strconv.Itoa(i) {
-			fmt.Println(h.Request(0).URL.Path)
-			fmt.Println("/test/object-" + strconv.Itoa(i))
-			t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
+			t.Fatalf("Wrong url path: %s, %v", h.Request(0).URL.Path, "/test/object-"+strconv.Itoa(i))
 		}
 
 		if op == "options" && h.Request(0).URL.Path != "/" {
@@ -1134,8 +1325,8 @@ func runNormalMultiEndpointTest(t *testing.T, op string) {
 		}
 	}
 
-	if testResults.CummulativeResult.Failcount != 0 {
-		t.Fatalf("Should not have failed. %d failures.", testResults.CummulativeResult.Failcount)
+	if testResults.CumulativeResult.Failcount != 0 {
+		t.Fatalf("Should not have failed. %d failures.", testResults.CumulativeResult.Failcount)
 	}
 
 	validateEndpointResult(t, testResults, endpoints, h)
@@ -1144,13 +1335,11 @@ func runNormalMultiEndpointTest(t *testing.T, op string) {
 func TestLargePutRequestToMultiEndpoint(t *testing.T) {
 	endpoints := 5
 	op := "put"
-	requests := 1000
 	h := initMultiS3TesterHelper(t, op, endpoints)
 	defer h.ShutdownMultiServer()
-	nrequest := intFlag{value: requests, set: true}
-	h.args.nrequests = &nrequest
-	h.args.concurrency = 10
-	h.args.osize = 5
+	h.args.Requests = 1000
+	h.args.Concurrency = 10
+	h.args.Size = 5
 	testResults := h.runTesterWithMultiEndpoints(t)
 
 	for i, h := range h.endpoints {
@@ -1158,12 +1347,12 @@ func TestLargePutRequestToMultiEndpoint(t *testing.T) {
 			t.Fatalf("Wrong request type issued. Expected %s but got %s", strings.ToUpper(op), h.Request(0).Method)
 		}
 
-		if len(*h.Requests) != requests/endpoints {
-			t.Fatalf("Wrong request number. Expected %d but got %d", requests/endpoints, len(*h.Requests))
+		if h.NumRequests() != 1000/endpoints {
+			t.Fatalf("Wrong request number. Expected %d but got %d", 1000/endpoints, h.NumRequests())
 		}
 
-		if testResults.PerEndpointResult[i].sumObjSize != 1000 {
-			t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", 1000, testResults.PerEndpointResult[i].sumObjSize)
+		if testResults.PerEndpointResult[i].TotalObjectSize != 1000 {
+			t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", 1000, testResults.PerEndpointResult[i].TotalObjectSize)
 		}
 	}
 
@@ -1175,8 +1364,8 @@ func TestMultiEndpointPutTagging(t *testing.T) {
 	op := "puttagging"
 	h := initMultiS3TesterHelper(t, op, endpoints)
 	defer h.ShutdownMultiServer()
-	h.args.concurrency = 2
-	h.args.tagging = "tag1=value1"
+	h.args.Concurrency = 2
+	h.args.Tagging = "tag1=value1"
 	testResults := h.runTesterWithMultiEndpoints(t)
 
 	for i, h := range h.endpoints {
@@ -1223,10 +1412,10 @@ func TestMultiEndpointPutTagging(t *testing.T) {
 func TestMultiEndpointMetadataUpdate(t *testing.T) {
 	endpoints := 2
 	op := "updatemeta"
-	h := initMultiS3TesterHelper(t, op, endpoints)
+	h := initMultiS3TesterHelperWithData(t, op, endpoints, xmlBodyString)
 	defer h.ShutdownMultiServer()
-	h.args.concurrency = 2
-	h.args.metadata = "key1=value1"
+	h.args.Concurrency = 2
+	h.args.Metadata = "key1=value1"
 	testResults := h.runTesterWithMultiEndpoints(t)
 
 	for i, h := range h.endpoints {
@@ -1261,11 +1450,11 @@ func TestMultiEndpointMultipartPut(t *testing.T) {
 	headers["ETag"] = "7e10e7d25dc4581d89b9285be5f384fd"
 	h := initMultiS3TesterHelperWithHeader(t, op, endpoints, headers)
 	defer h.ShutdownMultiServer()
-	h.args.partsize = 100
-	h.args.osize = 200
-	h.args.metadata = "key1=value1"
-	h.args.concurrency = 2
-	h.args.metadata = "key1=value1"
+	h.args.PartSize = 100
+	h.args.Size = 200
+	h.args.Metadata = "key1=value1"
+	h.args.Concurrency = 2
+	h.args.Metadata = "key1=value1"
 
 	uid := "VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA"
 
@@ -1277,7 +1466,7 @@ func TestMultiEndpointMultipartPut(t *testing.T) {
 			<Key>object-` + strconv.Itoa(i) + `</Key>
 			<UploadId>VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA</UploadId>
 			</InitiateMultipartUploadResult>`
-		multipartInitiateReq := Request{Uri: "/test/object-" + strconv.Itoa(i) + "?uploads=", Method: "POST"}
+		multipartInitiateReq := Request{URI: "/test/object-" + strconv.Itoa(i) + "?uploads=", Method: "POST"}
 		multipartInitiateResponse := Response{Body: multipartInitiateBody, Status: 200}
 		h.SetRequestResult(multipartInitiateReq, multipartInitiateResponse)
 
@@ -1289,7 +1478,7 @@ func TestMultiEndpointMultipartPut(t *testing.T) {
 			<Key>object-` + strconv.Itoa(i) + `</Key>
 			<ETag>"3858f62230ac3c915f300c664312c11f-9"</ETag>
 			</CompleteMultipartUploadResult>`
-		multipartCompleteReq := Request{Uri: fmt.Sprintf("/test/object-"+strconv.Itoa(i)+"?uploadId=%s", uid), Method: "POST"}
+		multipartCompleteReq := Request{URI: fmt.Sprintf("/test/object-"+strconv.Itoa(i)+"?uploadId=%s", uid), Method: "POST"}
 		multipartCompleteResponse := Response{Body: multipartCompleteBody, Status: 200}
 		h.SetRequestResult(multipartCompleteReq, multipartCompleteResponse)
 	}
@@ -1352,20 +1541,20 @@ func validateEndpointResult(t *testing.T, testResults results, endpoints int, h 
 	endpointList := make([]string, 0)
 
 	for _, endpointResult := range testResults.PerEndpointResult {
-		if endpointResult.Concurrency != h.args.concurrency/endpoints {
-			t.Fatalf("The concurrency of one endpoint %d should equal to total concurrency divide by endpoints %d.", endpointResult.Concurrency, h.args.concurrency/endpoints)
+		if endpointResult.Concurrency != h.args.Concurrency/endpoints {
+			t.Fatalf("The concurrency of one endpoint %d should equal to total concurrency divide by endpoints %d.", endpointResult.Concurrency, h.args.Concurrency/endpoints)
 		}
 
-		if endpointResult.AverageObjectSize != testResults.CummulativeResult.AverageObjectSize {
-			t.Fatalf("The AverageObjectSize of one endpoint %f should equal to AverageObjectSize of the total result %f.", endpointResult.AverageObjectSize, testResults.CummulativeResult.AverageObjectSize)
+		if endpointResult.AverageObjectSize != testResults.CumulativeResult.AverageObjectSize {
+			t.Fatalf("The AverageObjectSize of one endpoint %f should equal to AverageObjectSize of the total result %f.", endpointResult.AverageObjectSize, testResults.CumulativeResult.AverageObjectSize)
 		}
 
-		if testResults.CummulativeResult.AverageObjectSize != 0 && endpointResult.UniqObjNum != h.args.nrequests.value/endpoints {
-			t.Fatalf("The UniqObjNum of one endpoint %d should equal to total requests divide by endpoints %d.", endpointResult.UniqObjNum, h.args.nrequests.value/endpoints)
+		if testResults.CumulativeResult.AverageObjectSize != 0 && endpointResult.UniqObjNum != h.args.Requests/endpoints {
+			t.Fatalf("The UniqObjNum of one endpoint %d should equal to total requests divide by endpoints %d.", endpointResult.UniqObjNum, h.args.Requests/endpoints)
 		}
 
-		if h.args.optype != "putget" && endpointResult.Count != h.args.nrequests.value/endpoints {
-			t.Fatalf("The Count of one endpoint %d should equal to total requests divide by endpoints %d.", endpointResult.Count, h.args.nrequests.value/endpoints)
+		if h.args.Operation != "putget" && endpointResult.Count != h.args.Requests/endpoints {
+			t.Fatalf("The Count of one endpoint %d should equal to total requests divide by endpoints %d.", endpointResult.Count, h.args.Requests/endpoints)
 		}
 
 		endpointList = append(endpointList, endpointResult.Endpoint)
@@ -1374,88 +1563,49 @@ func validateEndpointResult(t *testing.T, testResults results, endpoints int, h 
 	sort.Slice(endpointList, func(i, j int) bool { return endpointList[i] < endpointList[j] })
 	sort.Slice(h.args.endpoints, func(i, j int) bool { return h.args.endpoints[i] < h.args.endpoints[j] })
 	if !reflect.DeepEqual(endpointList, h.args.endpoints) {
-		t.Fatalf("The endpoint list of result should deelpy equal to args.endpoints")
+		t.Fatalf("The endpoint list of result should deeply equal to args.endpoints")
 	}
 }
 
 func TestMergeSingleSuccessResult(t *testing.T) {
-	args := testArgs("put", "http://test1.com")
-	args.concurrency = 100
+	config := testArgs(t, "put", "http://test1.com")
+	args := config.worklist[0]
+	args.Concurrency = 100
 	startTime := time.Now()
-	c := make(chan result, args.concurrency)
+	c := make(chan Result, args.Concurrency)
 	addFakeResultToChannel(c, args, true, startTime)
 	testResults := collectWorkerResult(c, args, startTime)
 	validateEndpointResults(t, testResults.PerEndpointResult, args, 300, 300, 0)
-	validateAggregateResult(t, &testResults.CummulativeResult, args, 300, 300, 0)
+	validateAggregateResult(t, &testResults.CumulativeResult, args, 300, 300, 0)
 	processTestResult(&testResults, args)
-	validateTestResult(t, &testResults.CummulativeResult, testResults.PerEndpointResult, args)
+	validateTestResult(t, &testResults.CumulativeResult, testResults.PerEndpointResult, args)
 }
 
 func TestMergeSingleFailResult(t *testing.T) {
-	args := testArgs("put", "http://test1.com")
-	args.concurrency = 100
+	config := testArgs(t, "put", "http://test1.com")
+	args := config.worklist[0]
+	args.Concurrency = 100
 	startTime := time.Now()
-	c := make(chan result, args.concurrency)
+	c := make(chan Result, args.Concurrency)
 	addFakeResultToChannel(c, args, false, startTime)
 	testResults := collectWorkerResult(c, args, startTime)
 	validateEndpointResults(t, testResults.PerEndpointResult, args, 0, 300, 300)
-	validateAggregateResult(t, &testResults.CummulativeResult, args, 0, 300, 300)
+	validateAggregateResult(t, &testResults.CumulativeResult, args, 0, 300, 300)
 	processTestResult(&testResults, args)
-	validateTestResult(t, &testResults.CummulativeResult, testResults.PerEndpointResult, args)
+	validateTestResult(t, &testResults.CumulativeResult, testResults.PerEndpointResult, args)
 }
 
-func TestMergeFourSuccessResult(t *testing.T) {
-	args := testArgs("put", "http://test1.com,http://test2.com,http://test3.com,http://test4.com")
-	args.concurrency = 100
-	startTime := time.Now()
-	c := make(chan result, args.concurrency)
-	addFakeResultToChannel(c, args, true, startTime)
-	testResults := collectWorkerResult(c, args, startTime)
-	validateEndpointResults(t, testResults.PerEndpointResult, args, 75, 75, 0)
-	validateAggregateResult(t, &testResults.CummulativeResult, args, 300, 300, 0)
-	processTestResult(&testResults, args)
-	validateTestResult(t, &testResults.CummulativeResult, testResults.PerEndpointResult, args)
-}
-
-func TestMergeFourFailedResult(t *testing.T) {
-	args := testArgs("put", "http://test1.com,http://test2.com,http://test3.com,http://test4.com")
-	args.concurrency = 100
-	startTime := time.Now()
-	c := make(chan result, args.concurrency)
-	addFakeResultToChannel(c, args, false, startTime)
-	testResults := collectWorkerResult(c, args, startTime)
-	validateEndpointResults(t, testResults.PerEndpointResult, args, 0, 75, 75)
-	validateAggregateResult(t, &testResults.CummulativeResult, args, 0, 300, 300)
-	processTestResult(&testResults, args)
-	validateTestResult(t, &testResults.CummulativeResult, testResults.PerEndpointResult, args)
-}
-
-func TestMixedResult(t *testing.T) {
-	args := testArgs("put", "http://test1.com,http://test2.com,http://test3.com,http://test4.com")
-	args.concurrency = 100
-	startTime := time.Now()
-	c := make(chan result, args.concurrency*2)
-	addFakeResultToChannel(c, args, true, startTime)
-	addFakeResultToChannel(c, args, false, startTime)
-	args.concurrency = 200
-	testResults := collectWorkerResult(c, args, startTime)
-	validateEndpointResults(t, testResults.PerEndpointResult, args, 75, 150, 75)
-	validateAggregateResult(t, &testResults.CummulativeResult, args, 300, 600, 300)
-	processTestResult(&testResults, args)
-	validateTestResult(t, &testResults.CummulativeResult, testResults.PerEndpointResult, args)
-}
-
-func addFakeResultToChannel(c chan<- result, args parameters, isSuccess bool, startTime time.Time) {
+func addFakeResultToChannel(c chan<- Result, args Parameters, isSuccess bool, startTime time.Time) {
 	for _, endpoint := range args.endpoints {
-		for currEndpointWorkerId := 0; currEndpointWorkerId < args.concurrency/len(args.endpoints); currEndpointWorkerId++ {
+		for currentEndpointWorkerID := 0; currentEndpointWorkerID < args.Concurrency/len(args.endpoints); currentEndpointWorkerID++ {
 			go createFakeResult(c, endpoint, isSuccess, startTime)
 		}
 	}
 }
 
-func createFakeResult(c chan<- result, endpoint string, isSuccess bool, startTime time.Time) {
+func createFakeResult(c chan<- Result, endpoint string, isSuccess bool, startTime time.Time) {
 	fakeResult := NewResult()
-	fakeResult.sumObjSize = 13
+	fakeResult.TotalObjectSize = 13
 	fakeResult.UniqObjNum = 3
 	fakeResult.Count = 3
 	if isSuccess {
@@ -1469,7 +1619,7 @@ func createFakeResult(c chan<- result, endpoint string, isSuccess bool, startTim
 	c <- fakeResult
 }
 
-func validateEndpointResults(t *testing.T, endpointResults []*result, args parameters, expectedUniqObjNum, expectedCount, expectedFailcount int) {
+func validateEndpointResults(t *testing.T, endpointResults []*Result, args Parameters, expectedUniqObjNum, expectedCount, expectedFailcount int) {
 	if len(args.endpoints) != 1 && len(endpointResults) != len(args.endpoints) {
 		t.Fatalf("The endpointResults length %d should equal to args.endpoints length %d.", len(endpointResults), len(args.endpoints))
 	}
@@ -1483,8 +1633,8 @@ func validateEndpointResults(t *testing.T, endpointResults []*result, args param
 		if endpointResult.UniqueName != "" {
 			t.Fatalf("The endpointResult.UniqueName should be an empty string %s.", endpointResult.UniqueName)
 		}
-		if endpointResult.Concurrency != args.concurrency/len(args.endpoints) {
-			t.Fatalf("The endpointResult.Concurrency %d should equal to workerNum %d.", endpointResult.Concurrency, args.concurrency/len(args.endpoints))
+		if endpointResult.Concurrency != args.Concurrency/len(args.endpoints) {
+			t.Fatalf("The endpointResult.Concurrency %d should equal to workerNum %d.", endpointResult.Concurrency, args.Concurrency/len(args.endpoints))
 		}
 		if endpointResult.UniqObjNum != expectedUniqObjNum {
 			t.Fatalf("The endpointResult.UniqObjNum %d should equal to expectedUniqObjNum %d.", endpointResult.UniqObjNum, expectedUniqObjNum)
@@ -1498,7 +1648,7 @@ func validateEndpointResults(t *testing.T, endpointResults []*result, args param
 	}
 }
 
-func validateAggregateResult(t *testing.T, aggregateResults *result, args parameters, expectedUniqObjNum, expectedCount, expectedFailcount int) {
+func validateAggregateResult(t *testing.T, aggregateResults *Result, args Parameters, expectedUniqObjNum, expectedCount, expectedFailcount int) {
 	if aggregateResults.Operation != "" {
 		t.Fatalf("The aggregateResults.Operation should be an empty string %s.", aggregateResults.Operation)
 	}
@@ -1519,18 +1669,15 @@ func validateAggregateResult(t *testing.T, aggregateResults *result, args parame
 	}
 }
 
-func validateTestResult(t *testing.T, aggregateResults *result, perEndpointResult []*result, args parameters) {
-	if aggregateResults.Operation != args.optype {
-		t.Fatalf("The aggregateResults.Operation %s should be %s.", aggregateResults.Operation, args.optype)
+func validateTestResult(t *testing.T, aggregateResults *Result, perEndpointResult []*Result, args Parameters) {
+	if aggregateResults.Operation != args.Operation {
+		t.Fatalf("The aggregateResults.Operation %s should be %s.", aggregateResults.Operation, args.Operation)
 	}
 	if aggregateResults.Category == "" {
 		t.Fatal("The aggregateResults.Operation should not be empty.")
 	}
 	if aggregateResults.UniqueName == "" {
 		t.Fatal("The aggregateResults.UniqueName should not be empty.")
-	}
-	if aggregateResults.Endpoint != "" {
-		t.Fatal("The aggregateResults.Endpoint should be empty.")
 	}
 
 	if len(args.endpoints) > 1 && len(perEndpointResult) != len(args.endpoints) {
@@ -1559,22 +1706,25 @@ func validateTestResult(t *testing.T, aggregateResults *result, perEndpointResul
 func TestRestoreObject(t *testing.T) {
 	h := initS3TesterHelper(t, "restore")
 	defer h.Shutdown()
-	h.args.tier = "Expedited"
-	h.args.days = 4
+	h.args.Tier = "Expedited"
+	h.args.Days = 4
 	h.runTester(t)
 	tierInBody := strings.Split(strings.Split(h.Body(0), "<Tier>")[1], "</Tier>")[0]
-	daysInBody, _ := strconv.ParseInt(strings.Split(strings.Split(h.Body(0), "<Days>")[1], "</Days>")[0], 10, 64)
+	daysInBody, err := strconv.ParseInt(strings.Split(strings.Split(h.Body(0), "<Days>")[1], "</Days>")[0], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if h.Request(0).Method != "POST" {
 		t.Fatalf("Wrong request type issued. Expected POST but got %s", h.Request(0).Method)
 	}
 
-	if h.args.tier != tierInBody {
-		t.Fatalf("Wrong restore tier. Expected %s but got %s", h.args.tier, tierInBody)
+	if h.args.Tier != tierInBody {
+		t.Fatalf("Wrong restore tier. Expected %s but got %s", h.args.Tier, tierInBody)
 	}
 
-	if h.args.days != daysInBody {
-		t.Fatalf("Wrong restore days. Expected %d but got %d", h.args.days, daysInBody)
+	if h.args.Days != daysInBody {
+		t.Fatalf("Wrong restore days. Expected %d but got %d", h.args.Days, daysInBody)
 	}
 
 	if h.Request(0).URL.Path != "/test/object-0" {
@@ -1582,195 +1732,80 @@ func TestRestoreObject(t *testing.T) {
 	}
 }
 
-func TestSingleWorkerReplay(t *testing.T) {
-	sampleS3RQ := `{"replay":[
-    [
-    {"key":"testobject-0", "bucket":"not","op":"put","size":10000},
-    {"key":"testobject-0", "bucket":"not","op":"head","size":10000}
-    ],
-    [
-    {"key":"testobject-0", "bucket":"not","op":"updatemeta","size":10000},
-    {"key":"testobject-0", "bucket":"not","op":"get","size":10000}
-    ],
-    [
-    {"key":"testobject-0", "bucket":"not","op":"delete","size":10000}
-    ]
-    ]}`
-	// use default value to load initS3TesterHelper
-	h := initS3TesterHelper(t, "")
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleS3RQ))
+func TestExecuteValidWorkload(t *testing.T) {
+	workload := `{
+		"global": {
+			"concurrency": 1,
+			"requests": 1,
+			"bucket": "test",
+			"endpoint": "https://test.com",
+			"operation": "head"
+		},
+		"workload": [
+			{"operation": "put"},
+			{"operation": "get", "bucket":"anotherbucket"},
+			{"prefix":"obj","operation":"delete"},
+			{}
+		]
+	}`
 
-	h.args.concurrency = 1
-	h.runTester(t)
+	h := initWorkloadTesterHelper(t, workload)
+	setValidAccessKeyEnv()
+	testResults := executeTester(context.Background(), h.config)
 
-	defer h.Shutdown()
-
-	if h.Size() != 5 {
-		t.Fatalf("Should received 4 requests. Had %v requests", h.Size())
+	if h.Empty() {
+		t.Fatalf("Did not receive any requests")
 	}
-	m := make(map[string]int, 5)
-	for i := 0; i < 5; i++ {
-		m[h.Request(i).Method] += 1
-	}
-	expectedM := map[string]int{"PUT": 2, "DELETE": 1, "GET": 1, "HEAD": 1}
 
-	if !reflect.DeepEqual(m, expectedM) {
-		t.Fatalf("Should have expected request types")
+	if h.NumBodies() != h.NumRequests() {
+		t.Fatalf("numBodies %d does not match numRequests %d", h.NumBodies(), h.NumRequests())
+	}
+
+	if h.Size() != 4 {
+		t.Fatalf("should receive 4 requests but got %d", h.Size())
+	}
+
+	checkRequests(t, h, 0, "PUT", "/test/testobject-0")
+	checkRequests(t, h, 1, "GET", "/anotherbucket/testobject-0")
+	checkRequests(t, h, 2, "DELETE", "/test/obj-0")
+	checkRequests(t, h, 3, "HEAD", "/test/testobject-0")
+
+	totalRequest := 0
+	failCount := 0
+	for _, testResult := range testResults {
+		totalRequest += testResult.CumulativeResult.Count
+		failCount += testResult.CumulativeResult.Failcount
+	}
+
+	checkExpectInt(t, 4, totalRequest)
+	checkExpectInt(t, 0, failCount)
+}
+
+func checkRequests(t *testing.T, h S3TesterHelper, i int, expectMethod, expectPath string) {
+	if h.Request(i).Method != expectMethod {
+		t.Fatalf("Wrong request type issued. Expected %s but got %s", expectMethod, h.Request(0).Method)
+	}
+
+	if h.Request(i).URL.Path != expectPath {
+		t.Fatalf("Wrong url path: %s, expected %s", h.Request(0).URL.Path, expectPath)
 	}
 }
 
-func TestMultiConcurrency(t *testing.T) {
-	sampleS3RQ := `{"replay":[
-    [
-    {"key":"testobject-4", "bucket":"not","op":"put","size":14},
-    {"key":"testobject-1", "bucket":"not","op":"put","size":11},
-    {"key":"testobject-2", "bucket":"not","op":"put","size":12},
-    {"key":"testobject-3", "bucket":"not","op":"put","size":13},
-    {"key":"testobject-0", "bucket":"not","op":"put","size":10},
-    {"key":"testobject-1", "bucket":"not","op":"get","size":11},
-    {"key":"testobject-2", "bucket":"not","op":"get","size":12},
-    {"key":"testobject-3", "bucket":"not","op":"get","size":13},
-    {"key":"testobject-1", "bucket":"not","op":"delete","size":11},
-    {"key":"testobject-2", "bucket":"not","op":"delete","size":12},
-    {"key":"testobject-4", "bucket":"not","op":"get","size":14},
-    {"key":"testobject-3", "bucket":"not","op":"delete","size":13},
-    {"key":"testobject-4", "bucket":"not","op":"delete","size":13},
-    {"key":"testobject-0", "bucket":"not","op":"get","size":10},
-    {"key":"testobject-0", "bucket":"not","op":"delete","size":10}
-    ]
-    ]}`
-	// use default value to load initS3TesterHelper
-	h := initS3TesterHelper(t, "")
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleS3RQ))
-
-	h.args.concurrency = 10
-	results := h.runTester(t)
-
-	defer h.Shutdown()
-
-	if h.Size() != 15 {
-		t.Fatalf("Should received 15 requests. Had %v requests", h.Size())
-	}
-	orderOps := []string{"PUT", "GET", "DELETE"}
-	actualM := make(map[string][]string, 5)
-
-	objectNames := map[string]int{"testobject-0": 0, "testobject-1": 0, "testobject-2": 0, "testobject-3": 0, "testobject-4": 0}
-
-	for k, _ := range objectNames {
-		actualM[k] = []string{}
-	}
-
-	for i := 0; i < 15; i++ {
-		index := strings.LastIndex(h.Request(i).URL.Path, `/`)
-		objName := h.Request(i).URL.Path[index+1:]
-		if v, ok := actualM[objName]; ok {
-			actualM[objName] = append(v, h.Request(i).Method)
-		} else {
-			t.Fatalf("objName should be an one of expectedObjectNames got %v", objName)
-		}
-	}
-
-	// Make sure operations occured in the correct order for each test-object
-	for _, v := range actualM {
-		for b := 0; b < len(v); b++ {
-			if v[b] != orderOps[b] {
-				t.Fatalf("Ops of the same key must occur in order, got %v, but expected %v", v[b], orderOps[b])
-			}
-		}
-	}
-
-	if results.CummulativeResult.sumObjSize != 60+(bodyLength*5) {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", 75+bodyLength, results.CummulativeResult.sumObjSize)
-	}
-}
-
-func TestPutMetaReplay(t *testing.T) {
-	sampleS3RQ := `{"replay":[
-    [
-    {"key":"testobject-0-0", "bucket":"not","op":"updatemeta","size":12},
-    {"key":"testobject-0-1", "bucket":"not","op":"updatemeta","size":24}
-    ]
-    ]}`
-	// use default value to load initS3TesterHelper
-	h := initS3TesterHelper(t, "")
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleS3RQ))
-
-	h.args.concurrency = 1
-	h.runTester(t)
-
-	defer h.Shutdown()
-
-	if h.Size() != 2 {
-		t.Fatalf("Should received 2 requests. Had %v requests", h.Size())
-	}
-
-	if h.Request(0).Method != "PUT" {
-		t.Fatalf("Wrong request type issued. Expected PUT but got %s", h.Request(0).Method)
-	}
-	if h.Request(0).Header.Get("x-amz-meta-kkkkkk") != strings.Repeat("v", 6) {
-		t.Fatalf("Wrong metadata header received: %s", h.Request(0).Header.Get("x-amz-meta-kkkkkk"))
-	}
-
-	if h.Request(1).Method != "PUT" {
-		t.Fatalf("Wrong request type issued. Expected PUT but got %s", h.Request(0).Method)
-	}
-	if h.Request(1).Header.Get("x-amz-meta-kkkkkkkkkkkk") != strings.Repeat("v", 12) {
-		t.Fatalf("Wrong metadata header received: %s", h.Request(0).Header.Get("x-amz-meta-kkkkkkkkkkkk"))
-	}
-
-}
-
-func TestMultiPutReplay(t *testing.T) {
-	sampleS3RQ := `{"replay":[
-    [
-    {"key":"testobject-0-4", "bucket":"not","op":"put","size":0},
-    {"key":"testobject-3-1", "bucket":"not","op":"put","size":10},
-    {"key":"testobject-1-2", "bucket":"not","op":"put","size":10},
-    {"key":"testobject-2-3", "bucket":"not","op":"put","size":10},
-    {"key":"testobject-3-0", "bucket":"not","op":"put","size":1},
-    {"key":"testobject-7-1", "bucket":"not","op":"put","size":2},
-    {"key":"testobject-6-2", "bucket":"not","op":"put","size":3},
-    {"key":"testobject-15-3", "bucket":"not","op":"put","size":4},
-    {"key":"testobject-9-1", "bucket":"not","op":"put","size":5},
-    {"key":"testobject-5-2", "bucket":"not","op":"put","size":6},
-    {"key":"testobject-1-4", "bucket":"not","op":"put","size":7},
-    {"key":"testobject-3-3", "bucket":"not","op":"put","size":8},
-    {"key":"testobject-2-4", "bucket":"not","op":"put","size":9},
-    {"key":"testobject-1-0", "bucket":"not","op":"put","size":10},
-    {"key":"testobject-0-0", "bucket":"not","op":"put","size":11}
-    ]
-    ]}`
-	// use default value to load initS3TesterHelper
-	h := initS3TesterHelper(t, "")
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleS3RQ))
-
-	h.args.concurrency = 10
-	results := h.runTester(t)
-
-	defer h.Shutdown()
-
-	if h.Size() != 15 {
-		t.Fatalf("Should received 15 requests. Had %v requests", h.Size())
-	}
-	if results.CummulativeResult.sumObjSize != 96 {
-		t.Fatalf("sumObjSize is wrong size. Expected 6, but got %d", results.CummulativeResult.sumObjSize)
-	}
-
-}
+const MixedWorkloadFile = "mixed-workload.json"
 
 func TestMixedPutGet(t *testing.T) {
 	sampleMixedWorkload := `{"mixedWorkload":[{"operationType":"put","ratio":50},
 											  {"operationType":"get","ratio":50}]
 											}`
-	h := initS3TesterHelper(t, "")
+	file := createFile(t, MixedWorkloadFile, sampleMixedWorkload)
+	defer file.Close()
+	defer os.Remove(MixedWorkloadFile)
+	h := initMixedWorkloadTesterHelper(t)
 
-	h.args.nrequests = &intFlag{value: 10, set: true}
-
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleMixedWorkload))
-
-	h.args.concurrency = 1
-	h.args.osize = 100
-	h.args.bucketname = "not"
+	h.args.Requests = 10
+	h.args.Concurrency = 1
+	h.args.Size = 100
+	h.args.Bucket = "not"
 
 	results := h.runTester(t)
 
@@ -1778,8 +1813,8 @@ func TestMixedPutGet(t *testing.T) {
 		t.Fatalf("Should received 10 requests. Had %v requests", h.Size())
 	}
 
-	if results.CummulativeResult.sumObjSize != 500+(5*bodyLength) {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", 500+(5*bodyLength), results.CummulativeResult.sumObjSize)
+	if results.CumulativeResult.TotalObjectSize != 500+5*int64(len(xmlBodyString)) {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", 500+5*int64(len(xmlBodyString)), results.CumulativeResult.TotalObjectSize)
 	}
 
 	defer h.Shutdown()
@@ -1788,15 +1823,15 @@ func TestMixedPutGet(t *testing.T) {
 func TestMixedPutGetLargeMultiCon(t *testing.T) {
 	sampleMixedWorkload := `{"mixedWorkload":[{"operationType":"put","ratio":100}]
 											}`
-	h := initS3TesterHelper(t, "")
+	file := createFile(t, MixedWorkloadFile, sampleMixedWorkload)
+	defer file.Close()
+	defer os.Remove(MixedWorkloadFile)
+	h := initMixedWorkloadTesterHelper(t)
 
-	h.args.nrequests = &intFlag{value: 250, set: true}
-
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleMixedWorkload))
-
-	h.args.concurrency = 5
-	h.args.osize = 30
-	h.args.bucketname = "not"
+	h.args.Requests = 250
+	h.args.Concurrency = 5
+	h.args.Size = 30
+	h.args.Bucket = "not"
 
 	results := h.runTester(t)
 
@@ -1804,12 +1839,12 @@ func TestMixedPutGetLargeMultiCon(t *testing.T) {
 		t.Fatalf("Should received 250 requests. Had %v requests", h.Size())
 	}
 
-	if results.CummulativeResult.sumObjSize != (250 * 30) {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", (125 * 30), results.CummulativeResult.sumObjSize)
+	if results.CumulativeResult.TotalObjectSize != (250 * 30) {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", (125 * 30), results.CumulativeResult.TotalObjectSize)
 	}
 
-	if results.CummulativeResult.Failcount != 0 {
-		t.Fatalf("Test should have no failures. %d failures.", results.CummulativeResult.Failcount)
+	if results.CumulativeResult.Failcount != 0 {
+		t.Fatalf("Test should have no failures. %d failures.", results.CumulativeResult.Failcount)
 	}
 
 	defer h.Shutdown()
@@ -1819,15 +1854,15 @@ func TestMixedPutGetLargeMultiCon2(t *testing.T) {
 	sampleMixedWorkload := `{"mixedWorkload":[{"operationType":"put","ratio":50},
 											  {"operationType":"get","ratio":50}]
 											}`
-	h := initS3TesterHelper(t, "")
+	file := createFile(t, MixedWorkloadFile, sampleMixedWorkload)
+	defer file.Close()
+	defer os.Remove(MixedWorkloadFile)
+	h := initMixedWorkloadTesterHelper(t)
 
-	h.args.nrequests = &intFlag{value: 250, set: true}
-
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleMixedWorkload))
-
-	h.args.concurrency = 5
-	h.args.osize = 30
-	h.args.bucketname = "not"
+	h.args.Requests = 250
+	h.args.Concurrency = 5
+	h.args.Size = 30
+	h.args.Bucket = "not"
 
 	results := h.runTester(t)
 
@@ -1835,12 +1870,12 @@ func TestMixedPutGetLargeMultiCon2(t *testing.T) {
 		t.Fatalf("Should received 250 requests. Had %v requests", h.Size())
 	}
 
-	if results.CummulativeResult.sumObjSize != (125*30)+(125*bodyLength) {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", (125*30)+(125*bodyLength), results.CummulativeResult.sumObjSize)
+	if results.CumulativeResult.TotalObjectSize != 125*30+125*int64(len(xmlBodyString)) {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", 125*30+125*int64(len(xmlBodyString)), results.CumulativeResult.TotalObjectSize)
 	}
 
-	if results.CummulativeResult.Failcount != 0 {
-		t.Fatalf("Test should have no failures. %d failures.", results.CummulativeResult.Failcount)
+	if results.CumulativeResult.Failcount != 0 {
+		t.Fatalf("Test should have no failures. %d failures.", results.CumulativeResult.Failcount)
 	}
 
 	defer h.Shutdown()
@@ -1852,15 +1887,15 @@ func TestMixedPutGetDeleteSmall(t *testing.T) {
 											  {"operationType":"updatemeta","ratio":25},
 											  {"operationType":"delete","ratio":25}]
 											}`
-	h := initS3TesterHelper(t, "")
+	file := createFile(t, MixedWorkloadFile, sampleMixedWorkload)
+	defer file.Close()
+	defer os.Remove(MixedWorkloadFile)
+	h := initMixedWorkloadTesterHelper(t)
 
-	h.args.nrequests = &intFlag{value: 4, set: true}
-
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleMixedWorkload))
-
-	h.args.concurrency = 1
-	h.args.osize = 30
-	h.args.bucketname = "not"
+	h.args.Requests = 4
+	h.args.Concurrency = 1
+	h.args.Size = 30
+	h.args.Bucket = "not"
 
 	results := h.runTester(t)
 
@@ -1868,18 +1903,18 @@ func TestMixedPutGetDeleteSmall(t *testing.T) {
 		t.Fatalf("Should received 4 requests. Had %v requests", h.Size())
 	}
 
-	if results.CummulativeResult.sumObjSize != (30 + bodyLength) {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", (30 + bodyLength), results.CummulativeResult.sumObjSize)
+	if results.CumulativeResult.TotalObjectSize != 30+int64(len(xmlBodyString)) {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", 30+int64(len(xmlBodyString)), results.CumulativeResult.TotalObjectSize)
 	}
 
-	if results.CummulativeResult.Failcount != 0 {
-		t.Fatalf("Test should have no failures. %d failures.", results.CummulativeResult.Failcount)
+	if results.CumulativeResult.Failcount != 0 {
+		t.Fatalf("Test should have no failures. %d failures.", results.CumulativeResult.Failcount)
 	}
-	reqs := []string{"PUT", "GET", "PUT", "DELETE"}
+	requests := []string{"PUT", "GET", "PUT", "DELETE"}
 
 	for i := 0; i < 4; i++ {
-		if h.Request(i).Method != reqs[i] {
-			t.Fatalf("Expected %v method, but got %v", reqs[i], h.Request(i).Method)
+		if h.Request(i).Method != requests[i] {
+			t.Fatalf("Expected %v method, but got %v", requests[i], h.Request(i).Method)
 		}
 
 	}
@@ -1893,15 +1928,16 @@ func TestMixedPutGetDeleteLarge(t *testing.T) {
 											  {"operationType":"updatemeta","ratio":25},
 											  {"operationType":"delete","ratio":25}]
 											}`
-	h := initS3TesterHelper(t, "")
 
-	h.args.nrequests = &intFlag{value: 100, set: true}
+	file := createFile(t, MixedWorkloadFile, sampleMixedWorkload)
+	defer file.Close()
+	defer os.Remove(MixedWorkloadFile)
+	h := initMixedWorkloadTesterHelper(t)
 
-	h.args.jsonDecoder = json.NewDecoder(strings.NewReader(sampleMixedWorkload))
-
-	h.args.concurrency = 4
-	h.args.osize = 30
-	h.args.bucketname = "not"
+	h.args.Requests = 100
+	h.args.Concurrency = 4
+	h.args.Size = 30
+	h.args.Bucket = "not"
 
 	results := h.runTester(t)
 
@@ -1909,12 +1945,12 @@ func TestMixedPutGetDeleteLarge(t *testing.T) {
 		t.Fatalf("Should received 100 requests. Had %v requests", h.Size())
 	}
 
-	if results.CummulativeResult.sumObjSize != (25*30)+(25*bodyLength) {
-		t.Fatalf("sumObjSize is wrong size. Expected %d, but got %d", (25*30)+(25*bodyLength), results.CummulativeResult.sumObjSize)
+	if results.CumulativeResult.TotalObjectSize != 25*30+25*int64(len(xmlBodyString)) {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", 25*30+25*int64(len(xmlBodyString)), results.CumulativeResult.TotalObjectSize)
 	}
 
-	if results.CummulativeResult.Failcount != 0 {
-		t.Fatalf("Test should have no failures. %d failures.", results.CummulativeResult.Failcount)
+	if results.CumulativeResult.Failcount != 0 {
+		t.Fatalf("Test should have no failures. %d failures.", results.CumulativeResult.Failcount)
 	}
 	defer h.Shutdown()
 
@@ -1929,13 +1965,573 @@ func BenchmarkRuntest(b *testing.B) {
 func runLargePerformanceTest() {
 	endpoints := 1
 	op := "put"
-	requests := 1000000
 	h := initMultiS3TesterHelper(nil, op, endpoints)
 	defer h.ShutdownMultiServer()
-	nrequest := intFlag{value: requests, set: true}
-	h.args.nrequests = &nrequest
-	h.args.concurrency = 1000
-	h.args.osize = 5
+	h.args.Requests = 1000000
+	h.args.Concurrency = 1000
+	h.args.Size = 5
 	setValidAccessKeyEnv()
-	runtest(h.args)
+	syscallParams := NewSyscallParams(h.args)
+	defer syscallParams.detach()
+	runtest(context.Background(), h.config, h.args, syscallParams)
+}
+
+var commandExpTests = []struct {
+	in  string
+	out []string
+}{
+	{``, nil},
+	{` `, nil},
+	{`a`, []string{`a`}},
+	{`aa bb cc`, []string{`aa`, `bb`, `cc`}},
+	{`a "b c"`, []string{`a`, `"b c"`}},
+	{`a 'b c'`, []string{`a`, `'b c'`}},
+	{`a "b c'`, []string{`a`, `"b`, `c'`}},
+	{`a 'b c"`, []string{`a`, `'b`, `c"`}},
+	{`a b" 'c`, []string{`a`, `b"`, `'c`}},
+	{`a b' "c`, []string{`a`, `b'`, `"c`}},
+	{`a b"b c`, []string{`a`, `b"b`, `c`}},
+	{`a b'b c`, []string{`a`, `b'b`, `c`}},
+	{`'bbb" 'b"`, []string{`'bbb" '`, `b"`}},
+	{`a" b "c`, []string{`a"`, `b`, `"c`}}, // Characters and quotes are separate matches, unlike shell "a b c"
+	{`"\"\""`, []string{`"\"`, `\""`}},     // Escapes are not supported, unlike with shell
+}
+
+func TestCommandExp(t *testing.T) {
+	for _, tt := range commandExpTests {
+		t.Run(tt.in, func(t *testing.T) {
+			out := commandExp.FindAllString(tt.in, -1)
+			if !reflect.DeepEqual(out, tt.out) {
+				t.Errorf("got %#v, want %#v", out, tt.out)
+			}
+		})
+	}
+}
+
+func TestHasPrefixAndSuffix(t *testing.T) {
+	if !HasPrefixAndSuffix("aba", "") {
+		t.Error()
+	}
+	if !HasPrefixAndSuffix("aba", "a") {
+		t.Error()
+	}
+	if !HasPrefixAndSuffix("aabaa", "aa") {
+		t.Error()
+	}
+	if HasPrefixAndSuffix("a", "a") {
+		t.Error()
+	}
+	if HasPrefixAndSuffix("aaa", "aa") {
+		t.Error()
+	}
+	if HasPrefixAndSuffix("abc", "a") {
+		t.Error()
+	}
+	if HasPrefixAndSuffix("abc", "c") {
+		t.Error()
+	}
+}
+
+func TestParseCommand(t *testing.T) {
+	if args := ParseCommand(""); len(args) != 0 {
+		t.Error()
+	}
+
+	want := []string{"a b", "c d", "\"e", "f'"}
+	if args := ParseCommand(`"a b" 'c d' "e f'`); !reflect.DeepEqual(args, want) {
+		t.Errorf("got %#v, want %#v", args, want)
+	}
+
+	err := os.Setenv("TESTVAR", "somevalue")
+	if err != nil {
+		t.Fatalf("got error on Setenv: %v", err)
+	}
+	want = []string{"a $TESTVAR", "somevalue", "somevalue", "${}"}
+	if args := ParseCommand("'a $TESTVAR' $TESTVAR ${TESTVAR} '${}'"); !reflect.DeepEqual(args, want) {
+		t.Errorf("got %#v, want %#v", args, want)
+	}
+}
+
+func TestExecuteNoCommand(t *testing.T) {
+	if err := ExecuteCommand(""); err != nil {
+		t.Error(err)
+	}
+	if err := ExecuteCommand(" "); err != nil {
+		t.Error(err)
+	}
+	if err := ExecuteCommand("\t"); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestEmptyHistogramSummary(t *testing.T) {
+	HistogramSummary(NewResult().latencies)
+}
+
+func TestVirtualHostedStyleURL(t *testing.T) {
+	host := "www.example.com:18082"
+	bucket := "test-bucket"
+	objectKey := "test-object"
+	expectedVirtualStyleURL := fmt.Sprintf("%s.%s/%s", bucket, host, objectKey)
+	expectedPathStyleURL := fmt.Sprintf("%s/%s/%s", host, bucket, objectKey)
+	var urlSent string
+	extractURLBeforeSend := func(r *request.Request) {
+		urlSent = fmt.Sprintf("%s%s", r.HTTPRequest.URL.Host, r.HTTPRequest.URL.Path)
+	}
+
+	config := testArgs(t, "put", host)
+	config.worklist[0].Bucket = bucket
+	config.worklist[0].Prefix = objectKey
+	args := config.worklist[0]
+	httpClient := http.Client{Timeout: time.Nanosecond}
+
+	// Run with virtual style enabled
+	args.AddressingStyle = addressingStyleVirtual
+	svc := MakeS3Service(&httpClient, config, &args, args.Endpoint, credentials.AnonymousCredentials)
+	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
+	Put(svc, args.Bucket, args.Prefix, "", args.Size, make(map[string]*string, 0))
+	if urlSent != expectedVirtualStyleURL {
+		t.Fatalf("URL sent: %s is NOT virtual hosted style: %s", urlSent, expectedVirtualStyleURL)
+	}
+
+	// Run with virtual style disabled (= forced path style)
+	args.AddressingStyle = addressingStylePath
+	svc = MakeS3Service(&httpClient, config, &args, args.Endpoint, credentials.AnonymousCredentials)
+	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
+	Put(svc, args.Bucket, args.Prefix, "", args.Size, make(map[string]*string, 0))
+	if urlSent != expectedPathStyleURL {
+		t.Fatalf("URL sent: %s is NOT path style: %s", urlSent, expectedPathStyleURL)
+	}
+}
+
+type mockSyscallParams struct {
+	*SyscallParams
+	testDone                   chan struct{}
+	t                          *testing.T
+	numRequestsSentAtInterrupt int
+}
+
+type mockSyscallCatcher struct {
+	stopWorkers chan struct{}
+}
+
+func (handler *mockSyscallParams) processAndPrintCollectedResults(results *[]results, config *Config, args Parameters) {
+	handler.workersInProgress.Wait()
+	totalRequests := 0
+	for i := 0; i < args.Concurrency; i++ {
+		result := <-handler.results
+		totalRequests += result.Count
+	}
+
+	if totalRequests < handler.numRequestsSentAtInterrupt || totalRequests > args.Requests {
+		handler.t.Errorf("Expected to have %d requests sent in total, but sent: %d",
+			handler.numRequestsSentAtInterrupt, totalRequests)
+	}
+
+	handler.testDone <- struct{}{}
+}
+
+// raise mock syscall after sending 10 requests
+func (catcher *mockSyscallCatcher) run(syscallHandleFunc func()) {
+	<-catcher.stopWorkers
+	syscallHandleFunc()
+}
+
+func TestCaptureDoneResultsOnInterruptSignal(t *testing.T) {
+	numRequestsSentAtInterrupt := 12
+
+	// set up http test server and mock syscall catcher
+	mockSyscallCatcher := mockSyscallCatcher{
+		stopWorkers: make(chan struct{}, 1),
+	}
+	var requests []*http.Request
+
+	mutex := &sync.Mutex{}
+	handler := http.NewServeMux()
+	handler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		requests = append(requests, r)
+		if len(requests) == numRequestsSentAtInterrupt {
+			mockSyscallCatcher.stopWorkers <- struct{}{}
+		}
+	})
+	testServer := httptest.NewServer(handler)
+	config := testArgs(t, "get", testServer.URL)
+	args := config.worklist[0]
+	args.Requests = 20
+	args.Concurrency = 4
+
+	// set up syscall handler
+	results := make([]results, 0)
+	parentCtx := context.Background()
+	childCtx, cancelChildCtx := context.WithCancel(parentCtx)
+	testDone := make(chan struct{})
+	mockSyscallParams := &mockSyscallParams{
+		SyscallParams:              NewSyscallParams(args),
+		testDone:                   testDone,
+		numRequestsSentAtInterrupt: numRequestsSentAtInterrupt,
+		t:                          t,
+	}
+
+	// run s3tester
+	go mockSyscallCatcher.run(cancelChildCtx)
+	defer cancelChildCtx()
+
+	go attach(childCtx, mockSyscallParams, &results, config, args)
+	runtest(childCtx, config, args, mockSyscallParams)
+	mockSyscallParams.detach()
+
+	// to make sure asserts in test logic has run
+	<-testDone
+}
+
+func TestRunSyscallCatcher(t *testing.T) {
+	didHandlerRun := false
+	wait := make(chan struct{})
+	mockHandler := func() {
+		didHandlerRun = true
+		wait <- struct{}{}
+	}
+
+	syscallCatcher := syscallSignal(make(chan os.Signal))
+	go syscallCatcher.run(mockHandler)
+	syscallCatcher <- syscall.SIGINT
+
+	<-wait
+	if !didHandlerRun {
+		t.Errorf("syscall was raised but handler didn't run.")
+	}
+}
+
+func TestRandomRangeMultipleOptions(t *testing.T) {
+	h := initS3TesterHelperWithData(t, "get", strings.Repeat("a", 100))
+	h.args.Requests = 500
+	h.args.RandomRange = "0-10000"
+	h.args.randomRangeMin = 0
+	h.args.randomRangeMax = 10000
+	h.args.randomRangeSize = 100
+	defer h.Shutdown()
+	testResults := h.runTester(t)
+
+	if avgObjectSize := testResults.CumulativeResult.TotalObjectSize / int64(h.NumRequests()); avgObjectSize != int64(h.args.randomRangeSize) {
+		t.Fatalf("Wrong average object size. Expected: %v, but got %v", h.args.randomRangeSize, avgObjectSize)
+	}
+
+	h.RangeRequests(func(request *http.Request) {
+		rangeHeader := request.Header.Get("Range")
+		re := regexp.MustCompile(`^\D*`) //strip 'bytes' in range header value
+		boundaries := strings.Split(re.ReplaceAllString(rangeHeader, ""), "-")
+		min, _ := strconv.ParseInt(boundaries[0], 10, 64)
+		max, _ := strconv.ParseInt(boundaries[1], 10, 64)
+
+		if rangeSize := max - min + 1; int64(rangeSize) != h.args.randomRangeSize {
+			t.Fatalf("Wrong range size. Expected: %v, but got %v", h.args.randomRangeSize, rangeSize)
+		}
+
+		if min < h.args.randomRangeMin {
+			t.Fatalf("Wrong range start index. Expected value smaller than %v, but got %v", h.args.randomRangeMin, min)
+		}
+
+		if max > h.args.randomRangeMax {
+			t.Fatalf("Wrong range start index. Expected value smaller than %v, but got %v", h.args.randomRangeMax, max)
+		}
+	})
+}
+
+func TestRandomRangeOnlyOneOption(t *testing.T) {
+	h := initS3TesterHelperWithData(t, "get", strings.Repeat("a", 100))
+	h.args.Requests = 100
+	h.args.RandomRange = "450-549/100"
+	h.args.randomRangeMin = 450
+	h.args.randomRangeMax = 549
+	h.args.randomRangeSize = 100
+	defer h.Shutdown()
+	testResults := h.runTester(t)
+
+	if avgObjectSize := testResults.CumulativeResult.TotalObjectSize / int64(h.NumRequests()); avgObjectSize != int64(h.args.randomRangeSize) {
+		t.Fatalf("Wrong average object size. Expected: %v, but got %v", h.args.randomRangeSize, avgObjectSize)
+	}
+
+	h.RangeRequests(func(request *http.Request) {
+		rangeHeader := request.Header.Get("Range")
+		expectedRangeHeader := fmt.Sprintf("bytes=%d-%d", h.args.randomRangeMin, h.args.randomRangeMax)
+
+		if rangeHeader != expectedRangeHeader {
+			t.Fatalf("Wrong range header. Expected: %s, but got %s", expectedRangeHeader, rangeHeader)
+		}
+	})
+}
+
+func TestRandomRangeOnlyOneOptionWithVerify(t *testing.T) {
+	h := initS3TesterHelperWithData(t, "get", strings.Repeat("object-0", 100)[450:550])
+	h.args.RandomRange = "450-549/100"
+	h.args.randomRangeMin = 450
+	h.args.randomRangeMax = 549
+	h.args.randomRangeSize = 100
+	h.args.Verify = 1
+	defer h.Shutdown()
+	testResults := h.runTester(t)
+
+	if avgObjectSize := testResults.CumulativeResult.TotalObjectSize / int64(h.NumRequests()); avgObjectSize != int64(h.args.randomRangeSize) {
+		t.Fatalf("Wrong average object size. Expected: %v, but got %v", h.args.randomRangeSize, avgObjectSize)
+	}
+
+	h.RangeRequests(func(request *http.Request) {
+		rangeHeader := request.Header.Get("Range")
+		expectedRangeHeader := fmt.Sprintf("bytes=%d-%d", h.args.randomRangeMin, h.args.randomRangeMax)
+
+		if rangeHeader != expectedRangeHeader {
+			t.Fatalf("Wrong range header. Expected: %s, but got %s", expectedRangeHeader, rangeHeader)
+		}
+	})
+}
+
+func TestRangeReadWithVerify(t *testing.T) {
+	testData := []struct {
+		contentRange string
+		rangeMin     int
+		rangeMax     int
+		rangeSize    int
+	}{
+		// large range read
+		{contentRange: "bytes=0-799", rangeMin: 0, rangeMax: 799, rangeSize: 800},
+
+		// range read aligned to key
+		{contentRange: "bytes=400-479", rangeMin: 400, rangeMax: 479, rangeSize: 80},
+
+		// unaligned range read
+		{contentRange: "bytes=117-593", rangeMin: 117, rangeMax: 593, rangeSize: 477},
+
+		// small range read
+		{contentRange: "bytes=799-799", rangeMin: 799, rangeMax: 799, rangeSize: 1},
+	}
+
+	for i, test := range testData {
+		testcase := fmt.Sprintf("%d Range: %s", i, test.contentRange)
+		t.Run(testcase, func(t *testing.T) {
+			responseBody := strings.Repeat("object-0", 100)[test.rangeMin : test.rangeMax+1]
+
+			h := initS3TesterHelperWithData(t, "get", responseBody)
+			h.args.Verify = 1
+			h.args.Range = test.contentRange
+			h.args.Size = int64(len(responseBody))
+			defer h.Shutdown()
+			testResults := h.runTester(t)
+
+			if avgObjectSize := testResults.CumulativeResult.TotalObjectSize / int64(h.NumRequests()); avgObjectSize != int64(test.rangeSize) {
+				t.Fatalf("Wrong average object size. Expected: %v, but got %v", test.rangeSize, avgObjectSize)
+			}
+
+			h.RangeRequests(func(request *http.Request) {
+				rangeHeader := request.Header.Get("Range")
+
+				if rangeHeader != test.contentRange {
+					t.Fatalf("Wrong range header. Expected: %s, but got %s", test.contentRange, rangeHeader)
+				}
+			})
+		})
+	}
+}
+
+func TestInvalidRangeReadWithVerify(t *testing.T) {
+	testData := []struct {
+		contentRange string
+		rangeMin     int
+		rangeMax     int
+	}{
+		// Response body is 1 byte ahead
+		{contentRange: "bytes=0-399", rangeMin: 1, rangeMax: 400},
+
+		// Response body is 1 byte behind
+		{contentRange: "bytes=400-479", rangeMin: 399, rangeMax: 478},
+	}
+
+	for i, test := range testData {
+		testcase := fmt.Sprintf("%d Range: %s", i, test.contentRange)
+		t.Run(testcase, func(t *testing.T) {
+			responseBody := strings.Repeat("object-0", 100)[test.rangeMin : test.rangeMax+1]
+
+			h := initS3TesterHelperWithData(t, "get", responseBody)
+			h.args.Verify = 1
+			h.args.Range = test.contentRange
+			h.args.Size = int64(len(responseBody))
+			defer h.Shutdown()
+			testResults := h.runTesterWithoutValidation(t)
+
+			if testResults.CumulativeResult.Failcount != 1 {
+				t.Fatalf("Test should have failed. %d failures.", testResults.CumulativeResult.Failcount)
+			}
+		})
+	}
+}
+
+func TestMultipartPutRangeRead(t *testing.T) {
+	// Multipartput data with partSize=85
+	var multipartPutData = strings.Repeat((strings.Repeat("object-0", 10) + "objec"), 10)
+	var partSize int64 = 85
+
+	testData := []struct {
+		contentRange string
+		rangeMin     int
+		rangeMax     int
+		rangeSize    int
+	}{
+		// multipart range read with rangeMin < partSize
+		{contentRange: "bytes=0-849", rangeMin: 0, rangeMax: 849, rangeSize: 850},
+
+		// multipart range read with rangeMin > partSize
+		{contentRange: "bytes=313-794", rangeMin: 313, rangeMax: 794, rangeSize: 482},
+	}
+
+	for i, test := range testData {
+		testcase := fmt.Sprintf("%d Range: %s", i, test.contentRange)
+		t.Run(testcase, func(t *testing.T) {
+			responseBody := multipartPutData[test.rangeMin : test.rangeMax+1]
+
+			h := initS3TesterHelperWithData(t, "get", responseBody)
+			h.args.Verify = 2
+			h.args.PartSize = partSize
+			h.args.Range = test.contentRange
+			h.args.Size = int64(len(responseBody))
+			defer h.Shutdown()
+			testResults := h.runTester(t)
+
+			if avgObjectSize := testResults.CumulativeResult.TotalObjectSize / int64(h.NumRequests()); avgObjectSize != int64(test.rangeSize) {
+				t.Fatalf("Wrong average object size. Expected: %v, but got %v", test.rangeSize, avgObjectSize)
+			}
+
+			h.RangeRequests(func(request *http.Request) {
+				rangeHeader := request.Header.Get("Range")
+
+				if rangeHeader != test.contentRange {
+					t.Fatalf("Wrong range header. Expected: %s, but got %s", test.contentRange, rangeHeader)
+				}
+			})
+		})
+	}
+}
+
+func TestMultipartPutNormalRead(t *testing.T) {
+	// Multipartput data with partSize=85
+	var multipartPutData = strings.Repeat((strings.Repeat("object-0", 10) + "objec"), 10)
+	var partSize int64 = 85
+
+	h := initS3TesterHelperWithData(t, "get", multipartPutData)
+	h.args.Verify = 2
+	h.args.Size = int64(len(multipartPutData))
+	h.args.PartSize = partSize
+	defer h.Shutdown()
+	testResults := h.runTester(t)
+
+	if h.Request(0).Method != "GET" {
+		t.Fatalf("Wrong request type issued. Expected GET but got %s", h.Request(0).Method)
+	}
+
+	if h.Request(0).URL.Path != "/test/object-0" {
+		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
+	}
+
+	if testResults.CumulativeResult.TotalObjectSize != int64(len(multipartPutData)) {
+		t.Fatalf("TotalObjectSize is wrong size. Expected %d, but got %d", bodyLength, testResults.CumulativeResult.TotalObjectSize)
+	}
+
+	if h.Request(0).Header.Get("Consistency-Control") != "" {
+		t.Fatalf("Get should not have set Consistency-Control (actual: %s)", h.Request(0).Header.Get("Consistency-Control"))
+	}
+}
+
+func TestQueryParams(t *testing.T) {
+	h := initS3TesterHelperWithData(t, "get", strings.Repeat("object-0", 10))
+	h.args.Size = 80
+	h.args.QueryParams = "test-query-param"
+	defer h.Shutdown()
+	h.runTester(t)
+
+	if h.Request(0).Method != "GET" {
+		t.Fatalf("Wrong request type issued. Expected GET but got %s", h.Request(0).Method)
+	}
+
+	if h.Request(0).URL.Path != "/test/object-0" {
+		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
+	}
+
+	if h.Request(0).URL.RawQuery != "test-query-param=" {
+		t.Fatalf("Wrong query parameters: %s", h.Request(0).URL.RawQuery)
+	}
+
+	if h.Request(0).Header.Get("Consistency-Control") != "" {
+		t.Fatalf("Get should not have set Consistency-Control (actual: %s)", h.Request(0).Header.Get("Consistency-Control"))
+	}
+}
+
+func TestAdditionalQueryParams(t *testing.T) {
+	h := initS3TesterHelper(t, "puttagging")
+	defer h.Shutdown()
+	h.args.Tagging = "tag1=value1"
+	h.args.QueryParams = "test=1"
+	h.runTester(t)
+
+	if h.Request(0).Method != "PUT" {
+		t.Fatalf("Wrong request type issued. Expected DELETE but got %s", h.Request(0).Method)
+	}
+
+	if h.Request(0).URL.Path != "/test/object-0" {
+		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
+	}
+
+	if h.Request(0).URL.RawQuery != "tagging=&test=1" {
+		t.Fatalf("Wrong query param: %s", h.Request(0).URL.RawQuery)
+	}
+}
+
+func TestMultipleQueryParams(t *testing.T) {
+	h := initS3TesterHelper(t, "puttagging")
+	defer h.Shutdown()
+	h.args.Tagging = "tag1=value1"
+	h.args.QueryParams = "test=1&test2=2&test3"
+	h.runTester(t)
+
+	if h.Request(0).Method != "PUT" {
+		t.Fatalf("Wrong request type issued. Expected DELETE but got %s", h.Request(0).Method)
+	}
+
+	if h.Request(0).URL.Path != "/test/object-0" {
+		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
+	}
+
+	if h.Request(0).URL.RawQuery != "tagging=&test=1&test2=2&test3=" {
+		t.Fatalf("Wrong query param: %s", h.Request(0).URL.RawQuery)
+	}
+}
+
+func TestDebugArgument(t *testing.T) {
+	h := initS3TesterHelper(t, "get")
+	h.config.Debug = true
+	defer h.Shutdown()
+
+	debugGetReq := Request{URI: "/test/object-0", Method: "GET"}
+	debugGetResponse := Response{Body: generateErrorXML(t, "BadRequest"), Status: 400}
+	h.SetRequestResult(debugGetReq, debugGetResponse)
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	testResults := h.runTesterWithoutValidation(t)
+
+	if h.Request(0).Method != "GET" {
+		t.Fatalf("Wrong request type issued. Expected GET but got %s", h.Request(0).Method)
+	}
+
+	if h.Request(0).URL.Path != "/test/object-0" {
+		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
+	}
+
+	if testResults.CumulativeResult.Failcount != 1 {
+		t.Fatalf("Test should have failed. %d failures.", testResults.CumulativeResult.Failcount)
+	}
+
+	// verify the response body was correctly written back by checking the error message constructed from the error xml
+	if !strings.Contains(buf.String(), "Failed get on object bucket 'test/object-0': BadRequest: BadRequest") {
+		t.Fatalf("Response body was not written back correctly: %s", buf.String())
+	}
 }
