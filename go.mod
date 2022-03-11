@@ -8,4 +8,4 @@ require (
 	golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
 )
 
-replace github.com/codahale/hdrhistogram => github.com/HdrHistogram/hdrhistogram-go v0.9.0
+replace github.com/codahale/hdrhistogram => github.com/HdrHistogram/hdrhistogram-go v1.1.2
