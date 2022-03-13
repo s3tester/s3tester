@@ -4,9 +4,9 @@ The goal of s3tester is to be a lightweight S3 performance testing utility. It i
 
 This tool is in active development - please submit feature requests in the issues page.
 
-## s3tester latest version
+## Releases
 
-- [2.1.0](https://github.com/s3tester/s3tester/releases/tag/2.1.0)
+Find and download latest release [here](https://github.com/s3tester/s3tester/releases).
 
 ## Minimum Requirements
 	
