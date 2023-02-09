@@ -315,7 +315,7 @@ func loadCredentialProfile(profile string, nosign bool) (*credentials.Credential
 func ReceiveS3Op(ctx context.Context, svc *s3.S3, httpClient *http.Client, args *Parameters, durationLimit *DurationSetting, limiter *rate.Limiter, workersChan *workerChan, r *Result, sysInterruptHandler SyscallHandler, debug bool) {
 	for op := range workersChan.workChan {
 		args.Size = int64(op.Size)
-		args.Bucket = op.Bucket + "s3tester"
+		args.Bucket = op.Bucket
 		// need to mock up garbage metadata if it is a SUPD S3 event
 		if op.Event == "updatemeta" {
 			args.Metadata = metadataValue(int(op.Size))
