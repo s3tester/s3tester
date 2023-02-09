@@ -136,6 +136,7 @@ func generateRequests(args *Parameters, ratios []opTrack, workload *workloadPara
 
 // Sends s3op to appropriate worker for mixedWorkload
 func sendS3op(op s3op, params *workloadParams, endpoint string, region string, addressingStyle string) {
+	/*
 	bucketWorkload := op.Bucket + "s3tester"
 	if _, ok := params.bucketMap[bucketWorkload]; !ok {
 		err := createBucket(params.bucketMap, bucketWorkload, endpoint, region, params.credentials, addressingStyle)
@@ -143,6 +144,7 @@ func sendS3op(op s3op, params *workloadParams, endpoint string, region string, a
 			log.Fatalf("Unable to create bucket for s3 workload %v", err)
 		}
 	}
+	*/
 	workerNum := getHashKey(params.hashKeys, op.Key+op.Bucket, params.concurrency)
 	params.workersChanSlice[workerNum].workChan <- op
 }
