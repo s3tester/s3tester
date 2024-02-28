@@ -4,13 +4,9 @@ The goal of s3tester is to be a lightweight S3 performance testing utility. It i
 
 This tool is in active development - please submit feature requests in the issues page.
 
-## s3tester latest version
-
-- [2.1.0](https://github.com/s3tester/s3tester/releases/tag/2.1.0)
-
 ## Minimum Requirements
 	
-- Go 1.7 or higher
+- Go 1.18 or higher
 
 ## Installation
 
@@ -47,11 +43,11 @@ $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 | days | int | The number of days that the restored object will be available for. Default: `1` |
 | debug | boolean | Print response body on request failure. |
 | describe | boolean | Instead of running tests, show the consolidated list of test parameters that will be used when a test is run. |
-| duration | int | Test duration in seconds. Mutually exclusive with `requests` |
+| duration | int | Test duration in seconds. Duration must be used without 'requests' for operations that do not need existing objects, such as options, put, and multipartput. Duration must be used with 'requests' for operations that do need existing objects, such as get (and will return to the beginning if the number of requests is exceeded). Duration cannot be used with operations that remove objects. |
 | endpoint | string | target endpoint(s). If multiple endpoints are specified separate them with a `,`. Note: the concurrency must be a multiple of the number of endpoints. Default: `"https://127.0.0.1:18082"` |
 | header | - | Specify one or more headers of the form `<header-name>: <header-value>`. |
+| incrementing | boolean | Force the key naming to be lexicographically increasing. This is achieved by zero-padding the numerical suffix. For most use cases, suffix-naming should be set to `together` if this parameter is set to true. |
 | json | boolean | The result will be printed out in JSON format if this flag exists. Default: `false` |
-| lockstep | boolean | Force all threads to advance at the same rate rather than run independently |
 | logdetail | string | Write detailed log to file |
 | loglatency | string | Write latency histogram to file | 
 | metadata  | string | The metadata to use for the objects. The string must be formatted as such: `'key1=value1&key2=value2'`. Used for `put`, `updatemeta`, `multipartput`, `putget` and `putget9010r` |
@@ -60,7 +56,7 @@ $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 | no-sign-request | boolean | Do not sign requests. Credentials will not be loaded if this argument is provided |
 | operation | string | Operation type: `put`, `multipartput`, `get`, `puttagging`, `updatemeta`, `randget`, `delete`, `options`, `head`, `restore`. Default: `put`
 | overwrite | int | Turns a PUT/GET/HEAD into an operation on the same S3 key. `1`: all writes/reads are to same object, `2`: threads clobber each other but each write/read is to unique objects | 
-| partsize | int | Size of each part in bytes. Only has an effect when a multipart put is used. Min: `5242880` (5MiB). Default: `5242880` (5MiB)|
+| partsize | int | Size of each part in bytes. Only has an effect when a multipart PUT is used. Metric and binary byte size entries are valid (for example, 5MiB = 5242880 and 5MB = 5000000).|
 | prefix | string | Object name prefix. Default: `testobject` |
 | profile | string | Use a specific profile from [AWS CLI credential file](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-profiles.html) |
 | query-params | string | Specify one or more custom query parameters of the form `<queryparam-name>=<queryparam-value>` or `<queryparam-name>` separated by ampersands. |
@@ -69,15 +65,16 @@ $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 | ratelimit | float | The total number of operations per second across all threads. Default: `1.7976931348623157e+308` | 
 | region | string | Region to send requests to. Default: `us-east-1` |
 | repeat | int | Repeat each S3 operation this many times: Default: `0` (do not repeat) |
-| requests | int | Total number of requests. Mutually exclusive with `duration`. Default: `1000` |
+| requests | int | Total number of requests. Default: `1000` |
 | retries | int | Number of retry attempts. Default: `0` |
 | retrysleep | int | How long to sleep in between each retry in milliseconds. Default: `0` (exponential backoff) |
 | rr | - | Reduced redundancy storage for PUT requests | 
-| size | int | Object size in bytes. Default: `30720` |
+| size | int | Object size in bytes. Metric and binary byte size entries are valid (for example, 5MiB = 5242880 and 5MB = 5000000). Default: `30720` |
+| suffix-naming | string | Determines how the numerical key names are divided between concurrent threads. One of: `separate`, `together`. (Default is `separate`.) If separate, each thread gets a separate numerical range to handle; if together, the threads are assigned numbers to increase at the same rate (this does not force the threads to sync with each other). |
 | tagging | string | The tag-set for the object. The tag-set must be formatted as such: `'tag1=value1&tag2=value2'`. Used for `put`, `puttagging`, `putget` and `putget9010r` |
 | tagging-directive | string | Specifies whether the object tag-set is copied from the source object or if it is replaced with the tag-set provided in the object copy request. Value must be one of 'COPY' or 'REPLACE'. Default: `COPY` |
 | tier | string | The retrieval option for restoring an object. One of `expedited`, `standard`, or `bulk`. AWS default option is standard if not specified. Default: `standard` |
-| uniformDist | string | Generates a uniform distribution of object sizes given a min-max size. Allowed values: `10` to `20`) |
+| uniformDist | string | Generates a uniform distribution of object sizes given a min-max size. Allowed values: `10` to `20` |
 | verify | int | Verify the retrieved data on a get operation. `0`: disable verify (default); `1`: normal put data, `2`: multipart put data. If verify equals `2`, partsize is required (default `partsize` is `5242880` bytes) |
 | workload | string | File path to a JSON file that describes a workload to be run. The file is parsed with the Go template package and must produce JSON that is valid according to the workload schema |
 
@@ -151,14 +148,14 @@ $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 ### Writing objects into a bucket
 
 ```raw
-./s3tester -concurrency=128 -size=20000000 -operation=put -requests=20000 -endpoint="https://10.96.105.5:18443" -prefix=3
+./s3tester -concurrency=128 -size=20MB -operation=put -requests=20000 -endpoint="https://10.96.105.5:18443" -prefix=3
 ```
 
 - Starts writing objects into the default bucket `test`.
 - The bucket needs to be created prior to running s3tester.
 - The naming of the ingested objects will be `3-object#` where `3` is the prefix specified and `object#` is a sequential number starting from zero and going to the number of requests.
 - This command will perform a total of 20,000 PUT requests (or in this case slightly less because 20,000 does not divide by 128).
-- The object size is 20,000,000 bytes.
+- The object size is 20MB (20,000,000 bytes).
 - Replace the sample IP/port combination with the one you are using.
 
 ### Reading objects from a bucket (and other operations)

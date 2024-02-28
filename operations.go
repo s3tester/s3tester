@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -48,7 +50,7 @@ func Options(client *http.Client, endpoint string) error {
 		defer resp.Body.Close()
 	}
 
-	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		log.Printf("OPTIONS request failed to read body: %v", err)
 	}
 
@@ -60,19 +62,19 @@ func Options(client *http.Client, endpoint string) error {
 }
 
 // Put performs an S3 PUT to the given bucket and key using the supplied configuration
-func Put(svc s3iface.S3API, bucket, key, tagging string, size int64, metadata map[string]*string) error {
+func Put(ctx context.Context, svc s3iface.S3API, bucket, key, tagging string, size int64, metadata map[string]*string) error {
 	obj := NewDummyReader(size, key)
 
-	hash, herr := calcMD5(obj)
-	if herr != nil {
-		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
+	contentMD5, err := encodeMD5(obj)
+	if err != nil {
+		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
 	}
 
 	params := &s3.PutObjectInput{
 		Bucket:        aws.String(bucket),
 		Key:           aws.String(key),
 		ContentLength: &size,
-		ContentMD5:    aws.String(hash),
+		ContentMD5:    aws.String(contentMD5),
 		Body:          obj,
 		Metadata:      metadata,
 	}
@@ -81,7 +83,7 @@ func Put(svc s3iface.S3API, bucket, key, tagging string, size int64, metadata ma
 		params.SetTagging(tagging)
 	}
 
-	_, err := svc.PutObject(params)
+	_, err = svc.PutObjectWithContext(ctx, params)
 
 	return err
 }
@@ -147,22 +149,39 @@ func UpdateMetadata(svc s3iface.S3API, bucket string, key string, metadata map[s
 	return Copy(svc, bucket, bucket, key, "", directiveCopy, metadata, directiveReplace)
 }
 
-// calcMD5 calculates the MD5 for data read from the reader. If we ever care about x-amx-Content-Sha256 header then we'll need to add that.
-func calcMD5(r *DummyReader) (hash string, err error) {
+// encodeHash calculates a Hash (MD5/SHA-256) for data read from the reader and encodes it
+func encodeHash(r *DummyReader, h hash.Hash, encode func(src []byte) string) (hash string, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
-		return "", err
+		return
 	}
 
 	defer func() {
 		_, err = r.Seek(0, io.SeekStart)
 	}()
 
-	h := md5.New()
 	if _, err = io.Copy(h, r); err != nil {
-		return "", err
+		return
 	}
-	hash = base64.StdEncoding.EncodeToString(h.Sum(nil))
-	return hash, nil
+
+	hash = encode(h.Sum(nil))
+	return
+}
+
+// encodeMD5 calculates an MD5 hash for data read from the reader and encodes it
+func encodeMD5(r *DummyReader) (string, error) {
+	return encodeHash(r, md5.New(), base64.StdEncoding.EncodeToString)
+}
+
+// encodeSHA256 calculates a SHA-256 hash for data read from the reader and encodes it
+func encodeSHA256(r *DummyReader) (string, error) {
+	return encodeHash(r, sha256.New(), hex.EncodeToString)
+}
+
+// WithSha256Header adds SHA-256 to the Header of the Request
+func WithSha256Header(sha256 string) request.Option {
+	return func(req *request.Request) {
+		req.HTTPRequest.Header.Set("X-Amz-Content-Sha256", sha256)
+	}
 }
 
 // MultipartPut initiates an S3 multipart upload for the given S3 object specified by the supplied bucket and key
@@ -188,93 +207,104 @@ func MultipartPut(ctx context.Context, svc s3iface.S3API, bucket, key string, si
 		lastobj = NewDummyReader(size-partSize*(numParts-1), key)
 	}
 
-	var output *s3.CreateMultipartUploadOutput
 	output, err := svc.CreateMultipartUploadWithContext(ctx, params)
+	if err != nil {
+		return err
+	}
 
-	if err == nil {
-		uploadID := output.UploadId
-		partdata := make([]*s3.CompletedPart, 0, numParts)
+	uploadID := output.UploadId
 
-		// log in-progress multipart upload so it can be aborted if a system interrupt occurs
-		sysInterruptHandler.addMultipartUpload(key, bucket, *uploadID)
+	// log in-progress multipart upload so it can be aborted if a system interrupt occurs
+	sysInterruptHandler.addMultipartUpload(key, bucket, *uploadID)
 
-		hash, herr := calcMD5(obj)
-		if herr != nil {
-			return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
-		}
-		uparams := &s3.UploadPartInput{
-			Bucket:        aws.String(bucket),
-			Key:           aws.String(key),
-			ContentLength: &partSize,
-			ContentMD5:    aws.String(hash),
-			Body:          obj,
-			UploadId:      uploadID,
-		}
-
-		for partnum := int64(1); partnum <= numParts-1; partnum++ {
-			/* In a more realistic scenario we would want to upload parts concurrently,
-			   but concurrency is already one of the test options... might want to figure out
-			   if/how this should consider the concurrency option before adding concurrency here.
-			*/
-			uparams.SetPartNumber(partnum)
-
-			var uoutput *s3.UploadPartOutput
-			uoutput, err = svc.UploadPartWithContext(ctx, uparams)
-			if err != nil {
-				break
-			}
-			part := &s3.CompletedPart{}
-			part.SetPartNumber(partnum)
-			part.SetETag(*uoutput.ETag)
-			partdata = append(partdata, part)
-			// We have to reset the object, since it is re-used for all
-			// parts and its size is set to be equal to that of a single part.
-			// If we don't reset the offset the second part read will get an EOF and have
-			// a zero byte body.
-			obj.Seek(0, io.SeekStart)
-		}
-
-		// Don't upload the last part if we had any part upload failures.
-		if err == nil {
-			uparams.SetBody(lastobj)
-			uparams.SetContentLength(lastobj.Size())
-			uparams.SetPartNumber(numParts)
-			hash, herr := calcMD5(lastobj)
-			if herr != nil {
-				return fmt.Errorf("Calculating MD5 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
-			}
-			uparams.SetContentMD5(hash)
-			var uoutput *s3.UploadPartOutput
-			uoutput, err = svc.UploadPartWithContext(ctx, uparams)
-			if err == nil {
-				part := &s3.CompletedPart{}
-				part.SetPartNumber(numParts)
-				part.SetETag(*uoutput.ETag)
-				partdata = append(partdata, part)
-			}
-		}
-
+	defer func() {
 		if err != nil {
 			aparams := &s3.AbortMultipartUploadInput{
 				Bucket:   aws.String(bucket),
 				Key:      aws.String(key),
 				UploadId: uploadID,
 			}
-			svc.AbortMultipartUpload(aparams)
-		} else {
-			cparams := &s3.CompleteMultipartUploadInput{
-				Bucket:   aws.String(bucket),
-				Key:      aws.String(key),
-				UploadId: uploadID,
+			if _, aerr := svc.AbortMultipartUpload(aparams); aerr != nil {
+				log.Printf("Failed to abort multipart upload %v/%v %v: %v", bucket, key, uploadID, aerr)
+				return
 			}
-
-			cpartdata := &s3.CompletedMultipartUpload{Parts: partdata}
-			cparams.SetMultipartUpload(cpartdata)
-
-			_, err = svc.CompleteMultipartUploadWithContext(ctx, cparams)
 		}
 		sysInterruptHandler.doneMultipartUpload(key, bucket, *uploadID)
+	}()
+
+	contentMD5, err := encodeMD5(obj)
+	if err != nil {
+		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
 	}
+	uparams := &s3.UploadPartInput{
+		Bucket:        aws.String(bucket),
+		Key:           aws.String(key),
+		ContentLength: &partSize,
+		ContentMD5:    aws.String(contentMD5),
+		Body:          obj,
+		UploadId:      uploadID,
+	}
+
+	contentSHA256, err := encodeSHA256(obj)
+	if err != nil {
+		return fmt.Errorf("Calculating SHA-256 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+	}
+
+	partdata := make([]*s3.CompletedPart, 0, numParts)
+	for partnum := int64(1); partnum <= numParts-1; partnum++ {
+		// In a more realistic scenario we would want to upload parts concurrently, but concurrency is already one of the test
+		// options... might want to figure out if/how this should consider the concurrency option before adding concurrency here.
+		uparams.SetPartNumber(partnum)
+
+		var uoutput *s3.UploadPartOutput
+		if uoutput, err = svc.UploadPartWithContext(ctx, uparams, WithSha256Header(contentSHA256)); err != nil {
+			return err
+		}
+		part := &s3.CompletedPart{}
+		part.SetPartNumber(partnum)
+		part.SetETag(*uoutput.ETag)
+		partdata = append(partdata, part)
+		// We have to reset the object, since it is re-used for all
+		// parts and its size is set to be equal to that of a single part.
+		// If we don't reset the offset the second part read will get an EOF and have
+		// a zero byte body.
+		if _, err = obj.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("Resetting object failed while uploading parts %v/%v %v: %v", bucket, key, uploadID, err)
+		}
+	}
+
+	uparams.SetBody(lastobj)
+	uparams.SetContentLength(lastobj.Size())
+	uparams.SetPartNumber(numParts)
+
+	if contentMD5, err = encodeMD5(lastobj); err != nil {
+		return fmt.Errorf("Calculating MD5 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+	}
+	uparams.SetContentMD5(contentMD5)
+
+	if contentSHA256, err = encodeSHA256(lastobj); err != nil {
+		return fmt.Errorf("Calculating SHA-256 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+	}
+
+	uoutput, err := svc.UploadPartWithContext(ctx, uparams, WithSha256Header(contentSHA256))
+	if err != nil {
+		return err
+	}
+	part := &s3.CompletedPart{}
+	part.SetPartNumber(numParts)
+	part.SetETag(*uoutput.ETag)
+	partdata = append(partdata, part)
+
+	cparams := &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(bucket),
+		Key:      aws.String(key),
+		UploadId: uploadID,
+	}
+
+	cpartdata := &s3.CompletedMultipartUpload{Parts: partdata}
+	cparams.SetMultipartUpload(cpartdata)
+
+	_, err = svc.CompleteMultipartUploadWithContext(ctx, cparams)
 	return err
 }
 
@@ -344,12 +374,12 @@ func identityGetObject(c s3iface.S3API, input *s3.GetObjectInput, verify int, pa
 	err = req.Send()
 	if err == nil && req.HTTPResponse.Body != nil {
 		defer func() {
-			io.Copy(ioutil.Discard, req.HTTPResponse.Body)
+			io.Copy(io.Discard, req.HTTPResponse.Body)
 			req.HTTPResponse.Body.Close()
 		}()
 
 		if verify == 0 {
-			_, err = io.Copy(ioutil.Discard, req.HTTPResponse.Body)
+			_, err = io.Copy(io.Discard, req.HTTPResponse.Body)
 			if err != nil {
 				err = fmt.Errorf("Error while reading body of %s/%s. %v", *input.Bucket, *input.Key, err)
 			}
@@ -452,20 +482,20 @@ func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Clie
 	case "options":
 		err = Options(client, r.Endpoint)
 	case "put":
-		if err = Put(svc, args.Bucket, keyName, args.Tagging, args.Size, parseMetadataString(args.Metadata)); err == nil {
-			r.TotalObjectSize += args.Size
+		if err = Put(ctx, svc, args.Bucket, keyName, args.Tagging, int64(args.Size), parseMetadataString(args.Metadata)); err == nil {
+			r.TotalObjectSize += int64(args.Size)
 		}
 	case "puttagging":
 		err = PutTagging(svc, args.Bucket, keyName, args.Tagging)
 	case "updatemeta":
 		err = UpdateMetadata(svc, args.Bucket, keyName, parseMetadataString(args.Metadata))
 	case "multipartput":
-		if err = MultipartPut(ctx, svc, args.Bucket, keyName, args.Size, args.PartSize, args.Tagging, parseMetadataString(args.Metadata), sysInterruptHandler); err == nil {
-			r.TotalObjectSize += args.Size
+		if err = MultipartPut(ctx, svc, args.Bucket, keyName, int64(args.Size), int64(args.PartSize), args.Tagging, parseMetadataString(args.Metadata), sysInterruptHandler); err == nil {
+			r.TotalObjectSize += int64(args.Size)
 		}
 	case "get":
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(svc, args.Bucket, keyName, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
+		if retrievedBytes, err = Get(svc, args.Bucket, keyName, args.Range, int64(args.Size), args.Verify, int64(args.PartSize)); err == nil {
 			r.TotalObjectSize += retrievedBytes
 		}
 	case "head":
@@ -482,7 +512,7 @@ func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Clie
 
 		key := args.Prefix + "-" + strconv.FormatInt(objnum, 10)
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(svc, args.Bucket, key, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
+		if retrievedBytes, err = Get(svc, args.Bucket, key, args.Range, int64(args.Size), args.Verify, int64(args.PartSize)); err == nil {
 			r.TotalObjectSize += retrievedBytes
 		}
 	case "restore":

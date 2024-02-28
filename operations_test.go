@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -23,7 +23,7 @@ func NewMockS3Client(handler func(interface{}) interface{}) *MockS3Client {
 	return &MockS3Client{S3OpHandler: handler}
 }
 
-func (m *MockS3Client) PutObject(in *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+func (m *MockS3Client) PutObjectWithContext(ctx context.Context, in *s3.PutObjectInput, opts ...request.Option) (*s3.PutObjectOutput, error) {
 	m.S3OpHandler(in)
 
 	return &s3.PutObjectOutput{}, nil
@@ -52,7 +52,7 @@ func TestPutOp(t *testing.T) {
 			t.Errorf("Expected content md5: %s, but got %s", md5, *i.ContentMD5)
 		}
 
-		data, err := ioutil.ReadAll(i.Body)
+		data, err := io.ReadAll(i.Body)
 
 		if err != nil {
 			t.Errorf("Failed to read %d expected bytes from objects. Error: %v", *i.ContentLength, err)
@@ -67,7 +67,7 @@ func TestPutOp(t *testing.T) {
 
 	svc := NewMockS3Client(handler)
 
-	Put(svc, "b", "k1", "", numBytes, map[string]*string{})
+	Put(context.Background(), svc, "b", "k1", "", numBytes, map[string]*string{})
 }
 
 func TestPutWithTagsOp(t *testing.T) {
@@ -89,7 +89,7 @@ func TestPutWithTagsOp(t *testing.T) {
 			t.Fatalf("Expected object size: %d but got: %d", numBytes, *i.ContentLength)
 		}
 
-		data, err := ioutil.ReadAll(i.Body)
+		data, err := io.ReadAll(i.Body)
 
 		if err != nil {
 			t.Fatalf("Failed to read %d expected bytes from objects. Error: %v", *i.ContentLength, err)
@@ -108,7 +108,7 @@ func TestPutWithTagsOp(t *testing.T) {
 
 	svc := NewMockS3Client(handler)
 
-	err := Put(svc, "b", "k1", tags, numBytes, map[string]*string{})
+	err := Put(context.Background(), svc, "b", "k1", tags, numBytes, map[string]*string{})
 
 	if err != nil {
 		t.Fatalf("Failed PUT operation with error: %v", err)

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/alecthomas/units"
 	"golang.org/x/time/rate"
 )
 
@@ -32,6 +33,10 @@ const (
 
 var (
 	operationTypes = []string{"put", "multipartput", "get", "puttagging", "updatemeta", "randget", "delete", "options", "head", "restore", "copy"}
+
+	// Operations either creating or not needing existing objects. These don't require --requests specified because keys are dynamically generated.
+	// Some other operations, such as GET, require --requests specified to constrain keys.
+	durationableOps = []string{"options", "put", "multipartput"}
 )
 
 // Config includes configuration that applies globally to all operations
@@ -71,13 +76,13 @@ type Parameters struct {
 	Duration          int         `json:"duration,omitempty"`
 	Endpoint          string      `json:"endpoint,omitempty"`
 	Header            headerFlags `json:"header,omitempty"`
-	Lockstep          bool        `json:"-"`
+	Incrementing      bool        `json:"incrementing,omitempty"`
 	Metadata          string      `json:"metadata,omitempty"`
 	MetadataDirective string      `json:"metadata-directive,omitempty"`
 	NoSignRequest     bool        `json:"no-sign-request,omitempty"`
 	Operation         string      `json:"operation,omitempty"`
 	Overwrite         int         `json:"-"`
-	PartSize          int64       `json:"partsize,omitempty"`
+	PartSize          byteSize    `json:"partsize,omitempty"`
 	Prefix            string      `json:"prefix,omitempty"`
 	Profile           string      `json:"profile,omitempty"`
 	QueryParams       string      `json:"query-params,omitempty"`
@@ -88,7 +93,8 @@ type Parameters struct {
 	Repeat            int         `json:"repeat,omitempty"`
 	MixedWorkload     string      `json:"-"`
 	Requests          int         `json:"requests,omitempty"`
-	Size              int64       `json:"size,omitempty"`
+	Size              byteSize    `json:"size,omitempty"`
+	SuffixNaming      string      `json:"suffix-naming,omitempty"`
 	Tagging           string      `json:"tagging,omitempty"`
 	TaggingDirective  string      `json:"tagging-directive,omitempty"`
 	Tier              string      `json:"-"`
@@ -110,7 +116,7 @@ type Parameters struct {
 
 // NewParameters returns default parameters
 func NewParameters() *Parameters {
-	return &Parameters{Header: make(headerFlags)}
+	return &Parameters{Header: make(headerFlags), PartSize: 5 * (1 << 20), Size: 30 * 1024}
 }
 
 func (params *Parameters) hasRandomSize() bool {
@@ -152,6 +158,11 @@ func (params *Parameters) Merge(fields map[string]interface{}, ignore []string) 
 	return nil
 }
 
+// IsDurationOperation returns true if the operation is duration-driven without a request count
+func (params *Parameters) IsDurationOperation() bool {
+	return contains(durationableOps, params.Operation) && params.Duration > 0
+}
+
 type headerFlags map[string]string
 
 func (hf *headerFlags) String() string {
@@ -168,13 +179,46 @@ func (hf *headerFlags) Set(v string) error {
 	return nil
 }
 
+type byteSize uint64
+
+func (b *byteSize) String() string {
+	return fmt.Sprintf("%v", *b)
+}
+
+func (b *byteSize) Set(s string) error {
+	bs, err := parseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b = bs
+	return nil
+}
+
+func parseByteSize(s string) (byteSize, error) {
+	size, err := strconv.Atoi(s)
+	if err == nil {
+		if size < 0 {
+			return 0, fmt.Errorf("size cannot be less than zero, got %v", size)
+		}
+		return byteSize(size), nil
+	}
+	bsize, err := units.ParseStrictBytes(s)
+	if err == nil {
+		if bsize < 0 {
+			return 0, fmt.Errorf("size cannot be less than zero, got %v", bsize)
+		}
+		return byteSize(bsize), nil
+	}
+	return 0, err
+}
+
 // makeSlice is a utility function for templates to generate array/slice literals
 func makeSlice(args ...interface{}) []interface{} {
 	return args
 }
 
 func parse(args []string) (*Config, error) {
-	flags := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	flags := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 
 	// Config fields
 	config := &Config{}
@@ -195,16 +239,16 @@ func parse(args []string) (*Config, error) {
 	flags.IntVar(&params.Concurrency, "concurrency", 1, "Maximum concurrent requests.")
 	flags.StringVar(&params.CopySourceBucket, "copy-source-bucket", "", "The name of the source bucket to use for copying objects.")
 	flags.Int64Var(&params.Days, "days", 1, "The number of days that the restored object will be available for")
-	flags.IntVar(&params.Duration, "duration", 0, "Test duration in seconds. Duration can be specified for these operations: options, put, multipartput, and delete")
+	flags.IntVar(&params.Duration, "duration", 0, "Test duration in seconds. Duration must be used without 'requests' for operations that do not need existing objects, such as options, put, and multipartput. Duration must be used with 'requests' for operations that do need existing objects, such as get (and will return to the beginning if the number of requests is exceeded). Duration cannot be used with operations that remove objects.")
 	flags.StringVar(&params.Endpoint, "endpoint", "https://127.0.0.1:18082", "target endpoint(s). If multiple endpoints are specified separate them with a ','. Note: the concurrency must be a multiple of the number of endpoints.")
 	flags.Var(&params.Header, "header", "Specify one or more headers of the form \"<header-name>: <header-value>\".")
-	flags.BoolVar(&params.Lockstep, "lockstep", false, "Force all threads to advance at the same rate rather than run independently")
+	flags.BoolVar(&params.Incrementing, "incrementing", false, "Force the key naming to be lexicographically increasing. This is achieved by zero-padding the numerical suffix. For most use cases, suffix-naming should be set to \"together\" if this parameter is set to true.")
 	flags.StringVar(&params.Metadata, "metadata", "", "The metadata to use for the objects. The string must be formatted as such: 'key1=value1&key2=value2'. Used for put, updatemeta, multipartput, putget and putget9010r.")
 	flags.StringVar(&params.MetadataDirective, "metadata-directive", directiveCopy, "Specifies whether the metadata is copied from the source object or if it is replaced with the metadata provided in the object copy request. Value must be one of 'COPY' or 'REPLACE'")
 	flags.BoolVar(&params.NoSignRequest, "no-sign-request", false, "Do not sign requests. Credentials will not be loaded if this argument is provided.")
 	flags.StringVar(&params.Operation, "operation", "put", "operation type: "+strings.Join(operationTypes, textSeriesSeparator))
 	flags.IntVar(&params.Overwrite, "overwrite", 0, "Turns a PUT/GET/HEAD into an operation on the same s3 key. (1=all writes/reads are to same object, 2=threads clobber each other but each write/read is to unique objects).")
-	flags.Int64Var(&params.PartSize, "partsize", 5*(1<<20), "Size of each part (min 5MiB); only has an effect when a multipart put is used")
+	flags.Var(&params.PartSize, "partsize", "Size of each part (min 5MiB); only has an effect when a multipart PUT is used. Metric and binary byte size entries are valid (for example, 5MiB = 5242880 and 5MB = 5000000).")
 	flags.StringVar(&params.Prefix, "prefix", "testobject", "object name prefix")
 	flags.StringVar(&params.Profile, "profile", "", "Use a specific profile from AWS CLI credential file (https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-profiles.html).")
 	flags.StringVar(&params.QueryParams, "query-params", "", "Specify one or more custom query parameters of the form \"<queryparam-name>=<queryparam-value>\" or \"<queryparam-name>\" separated by ampersands.")
@@ -222,7 +266,8 @@ func parse(args []string) (*Config, error) {
 ]}
 Note: Requests are generated in the same order that you specify operations. That is, if you specify a delete followed by a put, but have no existing objects to delete, all of the deletes will fail.`)
 	flags.IntVar(&params.Requests, "requests", 1000, "Total number of requests.")
-	flags.Int64Var(&params.Size, "size", 30*1024, "Object size.")
+	flags.Var(&params.Size, "size", "Object size. Metric and binary byte size entries are valid (for example, 5MiB = 5242880 and 5MB = 5000000).")
+	flags.StringVar(&params.SuffixNaming, "suffix-naming", "", "Determines how the numerical key names are divided between concurrent threads. One of: separate, together. (Default is separate.) If separate, each thread gets a separate numerical range to handle; if together, the threads are assigned numbers to increase at the same rate (this does not force the threads to sync with each other).")
 	flags.StringVar(&params.Tagging, "tagging", "", "The tag-set for the object. The tag-set must be formatted as such: 'tag1=value1&tag2=value2'. Used for put, puttagging, putget and putget9010r.")
 	flags.StringVar(&params.TaggingDirective, "tagging-directive", directiveCopy, "Specifies whether the object tag-set is copied from the source object or if it is replaced with the tag-set provided in the object copy request. Value must be one of 'COPY' or 'REPLACE'")
 	flags.StringVar(&params.Tier, "tier", "standard", "The retrieval option for restoring an object. One of expedited, standard, or bulk. AWS default option is standard if not specified")
@@ -234,7 +279,7 @@ Note: Requests are generated in the same order that you specify operations. That
 		fmt.Fprintf(os.Stderr, "It reads credentials from the environment variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or loads credentials generated by AWS CLI.\n")
 		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "Key naming is unique per key unless the 'overwrite' option is used. The naming is as follows:\n")
-		fmt.Fprintf(os.Stderr, "    Key names are equal to \"<prefix>-N-M\" where N is 0..concurrency-1 and M is the request within that connection.\n")
+		fmt.Fprintf(os.Stderr, "    Key names are equal to \"<prefix>-<suffix>\" where the suffix is a number that is incremented as requests are issued.\n")
 		fmt.Fprintf(os.Stderr, "This means all the various client operations (GET, PUT, DELETE, etc) will use the same object names assuming the same parameters are used.\n")
 		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "You can control how many client machine cores the tester uses by setting the GOMAXPROCS env variable, e.g. to use 8 cores:\n")
@@ -248,6 +293,8 @@ Note: Requests are generated in the same order that you specify operations. That
 		fmt.Fprintf(os.Stderr, "should be able to generate about 5000 30K PUTs/second (should saturate a 1GBps network interface) \n")
 		fmt.Fprintf(os.Stderr, "and 20000 DELETE requests/s (with GOMAXPROCS=# of cores and concurrency>=# of cores)\n")
 		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "To print out HTTP Response Headers for failed requests, use ';' separated list of headers with environment variable %s \n", s3TesterPrintResponseHeaderEnv)
+		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 		flags.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\n")
@@ -260,7 +307,10 @@ Note: Requests are generated in the same order that you specify operations. That
 	consistencyControlTypes := []string{"all", "available", "strong-global", "strong-site", "read-after-new-write", "weak"}
 	consistencyControl := flags.String("consistency", "", "The StorageGRID consistency control to use for all requests. Does nothing against non StorageGRID systems. ("+strings.Join(consistencyControlTypes, textSeriesSeparator)+")")
 
-	flags.Parse(args)
+	err := flags.Parse(args)
+	if err != nil {
+		return nil, err
+	}
 	// Backwards compatibility
 	if *reducedRedundancy {
 		params.Header["x-amz-storage-class"] = "REDUCED_REDUNDANCY"
@@ -273,7 +323,7 @@ Note: Requests are generated in the same order that you specify operations. That
 	}
 
 	// validation after parsing
-	err := validateConfig(config)
+	err = validateConfig(config)
 	if err != nil {
 		return nil, err
 	}
@@ -395,12 +445,11 @@ func setupParam(args *Parameters) error {
 			return fmt.Errorf("Duration not supported for operation %q", args.Operation)
 		}
 
-		ops := []string{"options", "put", "multipartput"} // Ops either creating or not needing existing objects
-		if isRequestsSet && contains(ops, args.Operation) {
+		if isRequestsSet && args.IsDurationOperation() {
 			return fmt.Errorf("Using duration with requests is not supported for operation %q", args.Operation)
 		}
 
-		if !isRequestsSet && !contains(ops, args.Operation) {
+		if !isRequestsSet && !args.IsDurationOperation() {
 			return fmt.Errorf("Using duration without requests is not supported for operation %q", args.Operation)
 		}
 	}
@@ -417,6 +466,14 @@ func setupParam(args *Parameters) error {
 
 	if args.Concurrency <= 0 {
 		return errors.New("Concurrency must be > 0")
+	}
+
+	if !strings.EqualFold(args.SuffixNaming, "separate") && !strings.EqualFold(args.SuffixNaming, "together") {
+		if args.SuffixNaming == "" {
+			args.SuffixNaming = "separate"
+		} else {
+			return errors.New("suffix-naming must be one of: separate, together")
+		}
 	}
 
 	if args.Operation == "copy" {
@@ -460,7 +517,7 @@ func setupParam(args *Parameters) error {
 	}
 
 	if args.UniformDist != "" && (args.Operation != "put" && args.Operation != "get") {
-		return errors.New("UniformDist can only be used with a put or get operation")
+		return errors.New("uniformDist can only be used with a put or get operation")
 	}
 
 	if !strings.EqualFold(args.Tier, "Standard") && !strings.EqualFold(args.Tier, "Expedited") && !strings.EqualFold(args.Tier, "Bulk") {
@@ -487,7 +544,7 @@ func setupParam(args *Parameters) error {
 
 	args.min, args.max, err = extractRangeMinMax(args.UniformDist)
 	if err != nil {
-		return errors.New("UniformDist must be in form 'min-max', where min and max are > 0,  min < max, and have a put or get as operation type")
+		return errors.New("uniformDist must be in form 'min-max', where min and max are > 0, min < max")
 	}
 
 	// validate random-range
@@ -531,7 +588,7 @@ func setupParam(args *Parameters) error {
 
 		_, _, err := extractRangeMinMax(rangeParts[1])
 		if err != nil {
-			return err
+			return fmt.Errorf("Unable to parse range: %v", err)
 		}
 	}
 
@@ -549,17 +606,17 @@ func extractRangeMinMax(arg string) (min int64, max int64, err error) {
 
 	boundaries := strings.Split(arg, "-")
 	if len(boundaries) != 2 {
-		return 0, 0, errors.New("argument is in invalid format")
+		return 0, 0, errors.New("<min>-<max> argument is in invalid format")
 	}
 
 	min, err = strconv.ParseInt(boundaries[0], 10, 64)
 	if err != nil || min < 0 {
-		return 0, 0, errors.New(randomRangeInvalidMinMaxErr)
+		return 0, 0, errors.New("min must be >= 0 and an integer")
 	}
 
 	max, err = strconv.ParseInt(boundaries[1], 10, 64)
 	if err != nil || max <= 0 {
-		return 0, 0, errors.New(randomRangeInvalidMinMaxErr)
+		return 0, 0, errors.New("max must be > 0 and an integer")
 	}
 
 	if min > max {
