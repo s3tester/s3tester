@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -22,9 +21,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/client"
@@ -32,19 +33,22 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/codahale/hdrhistogram"
 	"golang.org/x/time/rate"
 )
 
 const (
 	// VERSION is displayed with help, bump when updating
-	VERSION = "3.0.0"
+	VERSION = "3.1.0"
 	// for identifying s3tester requests in the user-agent header
 	userAgentString = "s3tester/"
 
 	// params.Overwrite options
 	overwriteSameKey        = 1
 	overwriteClobberThreads = 2
+	// not a program option, only an input for correctEndpointUniqObjCountWithOverwriteSetting and correctResultsUniqObjCountWithOverwrites
+	overwriteForDuration = 3
+
+	s3TesterPrintResponseHeaderEnv = "S3TESTER_PRINT_RESPONSE_HEADERS"
 )
 
 var (
@@ -84,18 +88,44 @@ func (r results) writeLatencyLog(latencyLogFile io.Writer) error {
 	return nil
 }
 
+// Results is a collection of results for a set of parameters and is safe for concurrent use by multiple goroutines
+type Results struct {
+	results []*results
+	mu      sync.RWMutex
+}
+
+// Append appends the given results value to the collection
+func (rs *Results) Append(r *results) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.results = append(rs.results, r)
+}
+
+// Range calls f sequentially for each results value in the collection
+func (rs *Results) Range(f func(value *results) error) error {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	for _, v := range rs.results {
+		if err := f(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Result includes performance results of individual runs or aggregated runs
 type Result struct {
 	Category   string `json:"category,omitempty"`
 	UniqueName string `json:"uniqueName,omitempty"`
 
-	Endpoint    string `json:"endpoint,omitempty"`
-	Bucket      string `json:"bucket,omitempty"`
-	Operation   string `json:"operation,omitempty"`
-	Concurrency int    `json:"concurrency,omitempty"`
-	UniqObjNum  int    `json:"totalUniqueObjects"`
-	Count       int    `json:"totalRequests"`
-	Failcount   int    `json:"failedRequests"`
+	Endpoint       string `json:"endpoint,omitempty"`
+	Bucket         string `json:"bucket,omitempty"`
+	Operation      string `json:"operation,omitempty"`
+	Concurrency    int    `json:"concurrency,omitempty"`
+	UniqObjNum     int    `json:"totalUniqueObjects"`
+	Count          int    `json:"totalRequests"`
+	Failcount      int    `json:"failedRequests"`
+	CancelledCount int    `json:"cancelledRequests"`
 
 	TotalElapsedTime   float64 `json:"totalElapsedTime (ms)"`
 	AverageRequestTime float64 `json:"averageRequestTime (ms)"`
@@ -246,6 +276,17 @@ func runtest(ctx context.Context, config *Config, args Parameters, sysInterruptH
 	return testResult
 }
 
+// Information about a work distributed to a worker.
+type work struct {
+	id                   uint64
+	endpoint             string
+	startTime            time.Time
+	limiter              *rate.Limiter
+	workerChan           *workerChan
+	credential           *credentials.Credentials
+	durationRequestCount *uint64
+}
+
 func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args Parameters, sysInterruptHandler SyscallHandler) {
 	credential, err := loadCredentialProfile(args.Profile, args.NoSignRequest)
 	if err != nil {
@@ -279,6 +320,15 @@ func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args 
 
 	for i, endpoint := range args.endpoints {
 		endpointStartTime := time.Now()
+
+		// Concurrent duration operation will need to sync object keys used in multiple goroutines
+		// using durationRequestCount so that the operation uses key space deterministically (i.e.
+		// object key starts at 0 and increments monotonically).
+		var durationRequestCount *uint64
+		if args.IsDurationOperation() {
+			durationRequestCount = new(uint64)
+		}
+
 		for currentEndpointWorkerID := 0; currentEndpointWorkerID < workersPerEndpoint; currentEndpointWorkerID++ {
 			workerID := i*workersPerEndpoint + currentEndpointWorkerID
 			var workChan *workerChan
@@ -288,8 +338,17 @@ func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args 
 				workChan.wg.Add(1)
 			}
 
-			go worker(ctx, c, config, args, credential, workerID, endpoint, endpointStartTime,
-				limiter, workChan, sysInterruptHandler)
+			work := work{
+				id:                   uint64(workerID),
+				endpoint:             endpoint,
+				startTime:            endpointStartTime,
+				limiter:              limiter,
+				workerChan:           workChan,
+				credential:           credential,
+				durationRequestCount: durationRequestCount,
+			}
+
+			go worker(ctx, c, config, args, &work, sysInterruptHandler)
 		}
 	}
 	if mixedWorkloadDecoder != nil {
@@ -311,11 +370,62 @@ func loadCredentialProfile(profile string, nosign bool) (*credentials.Credential
 	return credential, err
 }
 
+func generateFormatString(overwrite int, maxRequestsPerWorker uint64, requests uint64) string {
+	var formatString string
+	switch overwrite {
+	case 1:
+		formatString = ""
+	case 2:
+		formatString = fmt.Sprintf("%%0%dd", len(strconv.FormatUint(maxRequestsPerWorker-1, 10)))
+	default:
+		formatString = fmt.Sprintf("%%0%dd", len(strconv.FormatUint(uint64(requests)-1, 10)))
+	}
+	return formatString
+}
+
+func generateKeyName(prefix string, counter uint64, maxRequestsPerWorker uint64, concurrency int, threadID uint64, overwrite int, formatString string, incrementing, separate, isDurationOperation bool, durationRequestCount *uint64) string {
+	var keyName string
+	switch overwrite {
+	case 1:
+		keyName = prefix
+	case 2:
+		if incrementing {
+			keyName = prefix + "-" + fmt.Sprintf(formatString, counter)
+		} else {
+			keyName = prefix + "-" + strconv.FormatUint(counter, 10)
+		}
+	default: // case 0
+		keyName = prefix + "-"
+		if isDurationOperation {
+			if incrementing {
+				keyName += fmt.Sprintf(formatString, atomic.AddUint64(durationRequestCount, 1)-1)
+			} else {
+				keyName += strconv.FormatUint(atomic.AddUint64(durationRequestCount, 1)-1, 10)
+			}
+		} else {
+			if separate {
+				if incrementing {
+					keyName += fmt.Sprintf(formatString, threadID*maxRequestsPerWorker+counter)
+				} else {
+					keyName += strconv.FormatUint(threadID*maxRequestsPerWorker+counter, 10)
+				}
+			} else {
+				if incrementing {
+					keyName += fmt.Sprintf(formatString, (counter*uint64(concurrency))+threadID)
+				} else {
+					keyName += strconv.FormatUint((counter*uint64(concurrency))+threadID, 10)
+				}
+			}
+		}
+	}
+	return keyName
+}
+
 // ReceiveS3Op receives s3 operations from the mixed workload decoder and dispatches them
 func ReceiveS3Op(ctx context.Context, svc *s3.S3, httpClient *http.Client, args *Parameters, durationLimit *DurationSetting, limiter *rate.Limiter, workersChan *workerChan, r *Result, sysInterruptHandler SyscallHandler, debug bool) {
 	for op := range workersChan.workChan {
-		args.Size = int64(op.Size)
-		args.Bucket = op.Bucket + "s3tester"
+		args.Size = byteSize(op.Size)
+		args.Bucket = op.Bucket
 		// need to mock up garbage metadata if it is a SUPD S3 event
 		if op.Event == "updatemeta" {
 			args.Metadata = metadataValue(int(op.Size))
@@ -329,14 +439,18 @@ func ReceiveS3Op(ctx context.Context, svc *s3.S3, httpClient *http.Client, args 
 }
 
 func sendRequest(ctx context.Context, svc *s3.S3, httpClient *http.Client, opType string, keyName string, args *Parameters, r *Result, limiter *rate.Limiter, sysInterruptHandler SyscallHandler, debug bool) {
-	r.Count++
 	start := time.Now()
 	err := DispatchOperation(ctx, svc, httpClient, opType, keyName, args, r, int64(args.Requests), sysInterruptHandler, debug)
 	elapsed := time.Since(start)
 	r.RecordLatency(elapsed)
-	if err != nil {
+	if aerr, ok := err.(awserr.Error); ok && aerr.Code() == request.CanceledErrorCode {
+		r.CancelledCount++
+	} else if err != nil {
 		r.Failcount++
+		r.Count++
 		log.Printf("Failed %s on object bucket '%s/%s': %v", args.Operation, args.Bucket, keyName, err)
+	} else {
+		r.Count++
 	}
 	r.elapsedSum += elapsed
 
@@ -345,20 +459,19 @@ func sendRequest(ctx context.Context, svc *s3.S3, httpClient *http.Client, opTyp
 	}
 
 	if limiter.Limit() != rate.Inf {
-		limiter.Wait(context.Background())
+		limiter.Wait(ctx)
 	}
 }
 
-func worker(ctx context.Context, results chan<- Result, config *Config, args Parameters, credentials *credentials.Credentials,
-	id int, endpoint string, runstart time.Time, limiter *rate.Limiter, workerChan *workerChan, sysInterruptHandler SyscallHandler) {
+func worker(ctx context.Context, results chan<- Result, config *Config, args Parameters, work *work, sysInterruptHandler SyscallHandler) {
 	httpClient := MakeHTTPClient()
-	svc := MakeS3Service(httpClient, config, &args, endpoint, credentials)
+	svc := MakeS3Service(httpClient, config, &args, work.endpoint, work.credential)
 	var source *rand.Rand
 
 	r := NewResult()
-	r.Endpoint = endpoint
+	r.Endpoint = work.endpoint
 	r.Bucket = args.Bucket
-	r.startTime = runstart
+	r.startTime = work.startTime
 	var resultWG sync.WaitGroup
 	resultWG.Add(1)
 
@@ -377,61 +490,65 @@ func worker(ctx context.Context, results chan<- Result, config *Config, args Par
 		source = rand.New(rand.NewSource(args.randomRangeSize))
 	}
 
-	durationLimit := NewDurationSetting(args.Duration, runstart)
+	durationLimit := NewDurationSetting(args.Duration, work.startTime)
 
-	if workerChan != nil {
-		ReceiveS3Op(ctx, svc, httpClient, &args, durationLimit, limiter, workerChan, &r, sysInterruptHandler, config.Debug)
+	if work.workerChan != nil {
+		ReceiveS3Op(ctx, svc, httpClient, &args, durationLimit, work.limiter, work.workerChan, &r, sysInterruptHandler, config.Debug)
 	} else {
-		maxRequestsPerWorker := int64(args.Requests / args.Concurrency)
-		durationWithoutRequests := args.Operation == "options" || args.Operation == "put" || args.Operation == "multipartput"
-		if durationLimit.applicable && durationWithoutRequests {
-			maxRequestsPerWorker = math.MaxInt64 / int64(args.Concurrency)
+		maxRequestsPerWorker := uint64(args.Requests / args.Concurrency)
+		if args.IsDurationOperation() {
+			maxRequestsPerWorker = math.MaxUint64
 		}
+		formatString := generateFormatString(args.Overwrite, maxRequestsPerWorker, uint64(args.Requests))
 
-		for j := int64(0); j < maxRequestsPerWorker; j++ {
-			var keyName string
-			switch args.Overwrite {
-			case 1:
-				keyName = args.Prefix
-			case 2:
-				keyName = args.Prefix + "-" + strconv.FormatInt(j, 10)
-			default:
-				keyName = args.Prefix + "-" + strconv.FormatInt(int64(id)*maxRequestsPerWorker+j, 10)
-			}
+	OUTER:
+		for {
+			for j := uint64(0); j < maxRequestsPerWorker; j++ {
+				if ctx.Err() != nil {
+					break OUTER
+				}
+				keyName := generateKeyName(args.Prefix, j, maxRequestsPerWorker, args.Concurrency, work.id, args.Overwrite, formatString, args.Incrementing, args.SuffixNaming == "separate", args.IsDurationOperation(), work.durationRequestCount)
 
-			if args.Operation != "options" {
-				r.UniqObjNum++
-			}
+				if args.Operation != "options" {
+					r.UniqObjNum++
+				}
 
-			for repcount := 0; repcount < args.attempts; repcount++ {
-				if source != nil {
-					if args.hasRandomSize() {
-						//size command line arg usually sets the size for each request we need to overwrite
-						// with new random size per request
-						newSize := randMinMax(source, args.min, args.max)
-						args.Size = newSize
-					} else if args.hasRandomRange() {
-						// range is inclusive
-						maxRangeStartIndex := args.randomRangeMax - args.randomRangeSize + 1
-						rangeStart := randMinMax(source, args.randomRangeMin, maxRangeStartIndex)
-						rangeEnd := rangeStart + args.randomRangeSize - 1
-						args.Range = fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
-						args.Size = args.randomRangeSize
+				for repcount := 0; repcount < args.attempts; repcount++ {
+					// Stop sending requests if the context has hit a deadline/timeout or been cancelled
+					if ctx.Err() != nil {
+						r.CancelledCount++
+						break OUTER
+					}
+					if source != nil {
+						if args.hasRandomSize() {
+							//size command line arg usually sets the size for each request we need to overwrite
+							// with new random size per request
+							newSize := randMinMax(source, args.min, args.max)
+							args.Size = byteSize(newSize)
+						} else if args.hasRandomRange() {
+							// range is inclusive
+							maxRangeStartIndex := args.randomRangeMax - args.randomRangeSize + 1
+							rangeStart := randMinMax(source, args.randomRangeMin, maxRangeStartIndex)
+							rangeEnd := rangeStart + args.randomRangeSize - 1
+							args.Range = fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
+							args.Size = byteSize(args.randomRangeSize)
+						}
+					}
+					sendRequest(ctx, svc, httpClient, args.Operation, keyName, &args, &r, work.limiter, sysInterruptHandler, config.Debug)
+
+					if durationLimit.enabled() {
+						results <- r
+						return
 					}
 				}
-				sendRequest(ctx, svc, httpClient, args.Operation, keyName, &args, &r, limiter, sysInterruptHandler, config.Debug)
-
-				if durationLimit.enabled() {
-					results <- r
-					return
-				}
 			}
 
-			// If we reached maximum requests when duration has not finished then go back to the beginning of the keys
-			if j == maxRequestsPerWorker-1 && durationLimit.applicable {
-				j = int64(-1)
+			// Keep sending requests until duration limit is reached.
+			if !durationLimit.applicable {
+				break
 			}
 		}
+
 	}
 
 	resultWG.Done()
@@ -443,6 +560,10 @@ func collectWorkerResult(c <-chan Result, args Parameters, startTime time.Time) 
 	workerWorkload := args.Requests / args.Concurrency
 	endpointResultMap := make(map[string]*Result)
 	var detailed []detail
+	overwrite := args.Overwrite
+	if args.Overwrite == 0 && args.Requests != 1000 && args.Duration != 0 {
+		overwrite = overwriteForDuration
+	}
 	if isLoggingDetails {
 		detailed = make([]detail, 0)
 	}
@@ -460,7 +581,7 @@ func collectWorkerResult(c <-chan Result, args Parameters, startTime time.Time) 
 		}
 
 		if endpointResultMap[r.Endpoint].Concurrency == workersPerEndpoint {
-			finishEndpointResultCollection(endpointResultMap[r.Endpoint], r.startTime, args.attempts, args.Overwrite, workerWorkload)
+			finishEndpointResultCollection(endpointResultMap[r.Endpoint], r.startTime, overwrite, workerWorkload, &args)
 		}
 
 		if detailed != nil {
@@ -469,23 +590,22 @@ func collectWorkerResult(c <-chan Result, args Parameters, startTime time.Time) 
 	}
 
 	testResult := processEndpointResults(endpointResultMap, args.endpoints)
-	testResult.correctResultsUniqObjCountWithOverwriteSetting(args.Overwrite, workerWorkload)
+	testResult.correctResultsUniqObjCountWithOverwriteSetting(overwrite, workerWorkload, args.Requests)
 	testResult.CumulativeResult.Bucket = args.Bucket
 	testResult.CumulativeResult.elapsedTime = time.Since(startTime)
 	testResult.CumulativeResult.detailed = detailed
 	return testResult
 }
 
-func finishEndpointResultCollection(endpointResult *Result, startTime time.Time, repeat, overwrite, workload int) {
+func finishEndpointResultCollection(endpointResult *Result, startTime time.Time, overwrite int, workload int, args *Parameters) {
 	endpointResult.elapsedTime = time.Since(startTime)
 
 	if endpointResult.UniqObjNum < endpointResult.Failcount {
 		endpointResult.UniqObjNum = 0
 	} else {
-		endpointResult.UniqObjNum -= endpointResult.Failcount
+		endpointResult.UniqObjNum = endpointResult.UniqObjNum - endpointResult.Failcount - endpointResult.CancelledCount
 	}
-
-	endpointResult.correctEndpointUniqObjCountWithOverwriteSetting(overwrite, workload)
+	endpointResult.correctEndpointUniqObjCountWithOverwriteSetting(overwrite, workload, args)
 }
 
 func mergeResult(aggregateResults, r *Result) {
@@ -494,24 +614,39 @@ func mergeResult(aggregateResults, r *Result) {
 	aggregateResults.UniqObjNum += r.UniqObjNum
 	aggregateResults.Count += r.Count
 	aggregateResults.Failcount += r.Failcount
+	aggregateResults.CancelledCount += r.CancelledCount
 	aggregateResults.elapsedSum += r.elapsedSum
 }
 
-func (r *Result) correctEndpointUniqObjCountWithOverwriteSetting(overwrite, workload int) {
+func (r *Result) correctEndpointUniqObjCountWithOverwriteSetting(overwrite int, workload int, args *Parameters) {
 	// this function should only be invoked by an endpoint result
 	// unique obj count should be consist with overwrite setting
-	if overwrite == overwriteSameKey && r.UniqObjNum > 0 {
-		r.UniqObjNum = 1
-	} else if overwrite == overwriteClobberThreads && r.UniqObjNum > workload {
-		r.UniqObjNum = workload
+	switch overwrite {
+	case overwriteSameKey:
+		if r.UniqObjNum > 0 {
+			r.UniqObjNum = 1
+		}
+	case overwriteClobberThreads:
+		if r.UniqObjNum > workload {
+			r.UniqObjNum = workload
+		}
+	case overwriteForDuration:
+		if r.UniqObjNum > args.Requests/len(args.endpoints) {
+			r.UniqObjNum = args.Requests / len(args.endpoints)
+		}
 	}
 }
 
-func (r *results) correctResultsUniqObjCountWithOverwriteSetting(overwrite, workload int) {
-	if overwrite == overwriteSameKey {
+func (r *results) correctResultsUniqObjCountWithOverwriteSetting(overwrite int, workload int, totalRequests int) {
+	switch overwrite {
+	case overwriteSameKey:
 		r.CumulativeResult.UniqObjNum = 1
-	} else if overwrite == overwriteClobberThreads {
+	case overwriteClobberThreads:
 		r.CumulativeResult.UniqObjNum = workload
+	case overwriteForDuration:
+		if r.CumulativeResult.UniqObjNum > totalRequests {
+			r.CumulativeResult.UniqObjNum = totalRequests
+		}
 	}
 }
 
@@ -597,7 +732,8 @@ func roundFloat(in float64, point int) float64 {
 func main() {
 	config, err := parse(os.Args[1:])
 	if err != nil {
-		log.Fatal(err)
+		log.Print(err)
+		os.Exit(2)
 	}
 
 	if config.CPUProfile != "" {
@@ -635,18 +771,24 @@ func main() {
 
 var isLoggingDetails bool
 
-func executeTester(ctx context.Context, config *Config) []results {
+func executeTester(ctx context.Context, config *Config) *Results {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	syscallCatcher := syscallSignal(make(chan os.Signal, 1))
-	go syscallCatcher.run(cancel)
+	// Cancel the context on SIGINT, in-flight requests should also be cancelled and new requests will not be sent
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT)
+	go func() {
+		// Currently we're stopping the signal channel so a second SIGINT will cause termination without printing results
+		defer signal.Stop(c)
+		<-c
+		cancel()
+	}()
 
-	results := make([]results, 0)
+	results := &Results{}
 	for _, task := range config.worklist {
 		sysInterruptHandler := NewSyscallParams(task)
-		go attach(ctx, sysInterruptHandler, &results, config, task)
-		results = append(results, executeSingleTest(ctx, config, task, sysInterruptHandler))
+		results.Append(executeSingleTest(ctx, config, task, sysInterruptHandler))
 		sysInterruptHandler.detach()
 	}
 
@@ -656,7 +798,6 @@ func executeTester(ctx context.Context, config *Config) []results {
 // SyscallHandler is an interface for exiting the program cleanly when a system interrupt is captured
 type SyscallHandler interface {
 	contextCancelListener(ctx context.Context, svc *s3.S3, testResult *Result, args *Parameters, resultWG *sync.WaitGroup)
-	processAndPrintCollectedResults(results *[]results, config *Config, args Parameters)
 	detach()
 	setTestStartTime(time time.Time)
 	addWorker()
@@ -664,11 +805,6 @@ type SyscallHandler interface {
 	doneMultipartUpload(key, bucket string, uploadID string)
 	abortMultipartRequests(svc *s3.S3)
 	done() <-chan struct{}
-}
-
-// SyscallCatcher is an interface for run() which captures system interrupts
-type SyscallCatcher interface {
-	run(syscallHandleFunc func())
 }
 
 // SyscallParams is used to stop the workers and collect their results when a system interrupt is captured
@@ -679,18 +815,6 @@ type SyscallParams struct {
 	stopAllBackgroundListeners chan struct{}
 	results                    chan Result
 	startTime                  time.Time
-}
-
-type syscallSignal chan os.Signal
-
-// cancel context by calling given syscallHandleFunc
-// when system interrupt is raised.
-func (catcher syscallSignal) run(syscallHandleFunc func()) {
-	signal.Notify(catcher, syscall.SIGINT)
-	defer signal.Stop(catcher)
-
-	<-catcher
-	syscallHandleFunc()
 }
 
 // NewSyscallParams constructs a SyscallParams instance used to stop and collect workers' results when a system interrupt is captured
@@ -706,31 +830,9 @@ func NewSyscallParams(args Parameters) *SyscallParams {
 	return &syscallParams
 }
 
-// call processAndPrintCollectedResults if context is cancelled.
-func attach(ctx context.Context, handler SyscallHandler, results *[]results,
-	config *Config, args Parameters) {
-	select {
-	case <-ctx.Done():
-		handler.processAndPrintCollectedResults(results, config, args)
-	case <-handler.done():
-		return
-	}
-}
-
-// Wait until all workers push their results into the handler.
-// Once results are ready, process and print them before exiting the program.
-func (handler *SyscallParams) processAndPrintCollectedResults(results *[]results, config *Config, args Parameters) {
-	handler.workersInProgress.Wait()
-	testResult := collectWorkerResult(handler.results, args, handler.startTime)
-	processTestResult(&testResult, args)
-	*results = append(*results, testResult)
-	handleTesterResults(config, *results)
-	os.Exit(0)
-}
-
 // Signal all background listeners for syscall handling to shut down
 // and wait until they all exit.
-// Listeners include: contextCancelListener(...), attach(...)
+// Listeners include: contextCancelListener(...)
 func (handler *SyscallParams) detach() {
 	close(handler.stopAllBackgroundListeners)
 	handler.workersInProgress.Wait()
@@ -794,7 +896,7 @@ func (handler *SyscallParams) abortMultipartRequests(svc *s3.S3) {
 	}
 }
 
-func executeSingleTest(ctx context.Context, config *Config, test Parameters, sysInterruptHandler SyscallHandler) results {
+func executeSingleTest(ctx context.Context, config *Config, test Parameters, sysInterruptHandler SyscallHandler) *results {
 	if test.Wait != 0 {
 		time.Sleep(time.Duration(test.Wait) * time.Second)
 	}
@@ -809,10 +911,10 @@ func executeSingleTest(ctx context.Context, config *Config, test Parameters, sys
 		log.Fatal(err)
 	}
 
-	return workResult
+	return &workResult
 }
 
-func handleTesterResults(config *Config, testResults []results) (int, error) {
+func handleTesterResults(config *Config, testResults *Results) (int, error) {
 	failCount := 0
 
 	// handle the errors in the end, so the results will still be rendered
@@ -833,10 +935,11 @@ func handleTesterResults(config *Config, testResults []results) (int, error) {
 	}
 
 	// Collect printable results
-	printableResults := make([]results, 0)
-	for _, testResult := range testResults {
-		printableResults = append(printableResults, testResult)
-	}
+	printableResults := make([]*results, 0)
+	testResults.Range(func(r *results) error {
+		printableResults = append(printableResults, r)
+		return nil
+	})
 
 	// Print the printable results
 	if config.JSON {
@@ -845,25 +948,25 @@ func handleTesterResults(config *Config, testResults []results) (int, error) {
 		printReadableResults(printableResults)
 	}
 
-	for _, testResult := range testResults {
+	testResults.Range(func(r *results) error {
+		failCount += r.CumulativeResult.Failcount
 		if detailLogFile != nil {
-			if err := testResult.writeDetailedLog(detailLogFile); err != nil {
+			if err := r.writeDetailedLog(detailLogFile); err != nil {
 				detailLogErr = err
 			}
 		}
-
 		if latencyLogFile != nil {
-			if err := testResult.writeLatencyLog(latencyLogFile); err != nil {
+			if err := r.writeLatencyLog(latencyLogFile); err != nil {
 				latencyLogErr = err
 			}
 		}
-
-		failCount += testResult.CumulativeResult.Failcount
-	}
+		return nil
+	})
 
 	if detailLogErr != nil {
 		return failCount, fmt.Errorf("Error writing detailed log to file: %v", detailLogErr)
 	}
+
 	if latencyLogErr != nil {
 		return failCount, fmt.Errorf("Error writing latency log to file: %v", latencyLogErr)
 	}
@@ -871,7 +974,7 @@ func handleTesterResults(config *Config, testResults []results) (int, error) {
 	return failCount, nil
 }
 
-func printReadableResults(testResults []results) {
+func printReadableResults(testResults []*results) {
 	for _, testResult := range testResults {
 		if len(testResult.PerEndpointResult) > 1 {
 			fmt.Println("\n\t--- Result per Endpoint ---")
@@ -925,7 +1028,7 @@ func formatFloat(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-func printJSONResults(testResults []results, configWorkload string) {
+func printJSONResults(testResults []*results, configWorkload string) {
 	if len(testResults) == 0 {
 		fmt.Println("{}")
 		return
@@ -1015,6 +1118,27 @@ func MakeS3Service(client *http.Client, config *Config, args *Parameters, endpoi
 		}
 	})
 
+	if headers := os.Getenv(s3TesterPrintResponseHeaderEnv); len(headers) > 0 {
+		var printedHeaders []string
+		for _, header := range strings.Split(headers, ";") {
+			if header = strings.TrimSpace(header); len(header) > 0 {
+				printedHeaders = append(printedHeaders, header)
+			}
+		}
+		if len(printedHeaders) > 0 {
+			svc.Client.Handlers.CompleteAttempt.PushFront(func(r *request.Request) {
+				if r.HTTPResponse.StatusCode < 200 || r.HTTPResponse.StatusCode >= 300 {
+					log.Println("Response Header Report:")
+					for _, header := range printedHeaders {
+						if v, ok := r.HTTPResponse.Header[header]; ok {
+							fmt.Fprintf(os.Stderr, "\t%s : %v\n", header, v)
+						}
+					}
+				}
+			})
+		}
+	}
+
 	if config.Debug {
 		svc.Client.Handlers.UnmarshalMeta.PushBack(func(r *request.Request) {
 			if r.HTTPResponse.StatusCode < 200 || r.HTTPResponse.StatusCode >= 300 {
@@ -1035,7 +1159,7 @@ func MakeS3Service(client *http.Client, config *Config, args *Parameters, endpoi
 func readErrorResponse(r *request.Request) ([]byte, error) {
 	buffer := make([]byte, 1000)
 	_, err := r.HTTPResponse.Body.Read(buffer)
-	r.HTTPResponse.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer), r.HTTPResponse.Body))
+	r.HTTPResponse.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buffer), r.HTTPResponse.Body))
 	if err == io.EOF {
 		return buffer, nil
 	}

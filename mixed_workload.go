@@ -10,9 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 type s3op struct {
@@ -39,8 +37,6 @@ var operations = map[string]bool{
 type workloadParams struct {
 	// hashKeys keeps track of keys that have already been hashed to a specific worker
 	hashKeys map[string]uint64
-	// keeps track if a bucket has already been created for mixed workload
-	bucketMap map[string]bool
 	// workersChanSlice is an s3 operation channel for each worker
 	workersChanSlice []*workerChan
 	concurrency      int
@@ -49,8 +45,7 @@ type workloadParams struct {
 
 func setupWorkloadParams(workerChans []*workerChan, concurrency int, credential *credentials.Credentials) *workloadParams {
 	keys := make(map[string]uint64)
-	buckets := make(map[string]bool)
-	return &workloadParams{hashKeys: keys, bucketMap: buckets, workersChanSlice: workerChans, concurrency: concurrency, credentials: credential}
+	return &workloadParams{hashKeys: keys, workersChanSlice: workerChans, concurrency: concurrency, credentials: credential}
 }
 
 func closeAllWorkerChannels(workChanSlice []*workerChan) {
@@ -128,52 +123,16 @@ func generateRequests(args *Parameters, ratios []opTrack, workload *workloadPara
 				op := s3op{Event: v.Operation, Size: uint64(args.Size), Bucket: args.Bucket, Key: args.Prefix + "-" + strconv.FormatInt(v.sent, 10)}
 				sent++
 				v.sent++
-				sendS3op(op, workload, args.endpoints[0], args.Region, args.AddressingStyle)
+				sendS3op(op, workload)
 			}
 		}
 	}
 }
 
 // Sends s3op to appropriate worker for mixedWorkload
-func sendS3op(op s3op, params *workloadParams, endpoint string, region string, addressingStyle string) {
-	bucketWorkload := op.Bucket + "s3tester"
-	if _, ok := params.bucketMap[bucketWorkload]; !ok {
-		err := createBucket(params.bucketMap, bucketWorkload, endpoint, region, params.credentials, addressingStyle)
-		if err != nil {
-			log.Fatalf("Unable to create bucket for s3 workload %v", err)
-		}
-	}
+func sendS3op(op s3op, params *workloadParams) {
 	workerNum := getHashKey(params.hashKeys, op.Key+op.Bucket, params.concurrency)
 	params.workersChanSlice[workerNum].workChan <- op
-}
-
-// creates a new Bucket
-func createBucket(currentBuckets map[string]bool, bucket string, endpoint string,
-	region string, credential *credentials.Credentials, addressingStyle string) error {
-	httpClient := MakeHTTPClient()
-
-	args := NewParameters()
-	args.Region = region
-	args.AddressingStyle = addressingStyle
-
-	svc := MakeS3Service(httpClient, &Config{}, args, endpoint, credential)
-
-	// check for bucket existence
-	_, err := svc.CreateBucket(&s3.CreateBucketInput{Bucket: aws.String(bucket),
-		CreateBucketConfiguration: &s3.CreateBucketConfiguration{
-			LocationConstraint: aws.String(region),
-		},
-	})
-
-	if err != nil {
-		return err
-	}
-	if err = svc.WaitUntilBucketExists(&s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		return err
-	}
-
-	currentBuckets[bucket] = true
-	return nil
 }
 
 // allocates an individual channel for each worker

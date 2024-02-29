@@ -146,10 +146,6 @@ func TestDefaultArgs(t *testing.T) {
 		t.Fatalf("wrong default overwrite: %v", args.Overwrite)
 	}
 
-	if args.Lockstep {
-		t.Fatalf("wrong default lockstep: %v", args.Lockstep)
-	}
-
 	if args.attempts != 1 {
 		t.Fatalf("wrong default attempts: %v", args.attempts)
 	}
@@ -180,6 +176,14 @@ func TestDefaultArgs(t *testing.T) {
 
 	if args.NoSignRequest != false {
 		t.Fatalf("wrong default nosign")
+	}
+
+	if args.SuffixNaming != "separate" {
+		t.Fatalf("wrong default suffix-naming")
+	}
+
+	if args.Incrementing != false {
+		t.Fatalf("wrong default incrementing")
 	}
 }
 
@@ -513,6 +517,24 @@ func TestInvalidDays(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("invalid restore tier should fail")
+	}
+}
+
+func TestValidSuffixNaming(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-suffix-naming=Together")
+	_, err := parse(cmdline)
+
+	if err != nil {
+		t.Fatalf("valid suffix-naming should succeed")
+	}
+}
+
+func TestInvalidSuffixNaming(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-suffix-naming=fakevalue")
+	_, err := parse(cmdline)
+
+	if err == nil {
+		t.Fatalf("invalid suffix-naming should fail")
 	}
 }
 
@@ -1233,9 +1255,148 @@ func TestRangeValidation(t *testing.T) {
 		t.Fatalf("Expected command to fail due to invalid range format")
 	}
 
+	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=10.0-15.0")
+	_, err = parse(cmdline)
+	expectedErr := "Unable to parse range: min must be >= 0 and an integer"
+	if err == nil || err.Error() != expectedErr {
+		t.Fatalf("invalid range should fail with error message: %s", expectedErr)
+	}
+
 	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=0-10")
 	_, err = parse(cmdline)
 	if err != nil {
 		t.Fatalf("Expected no err, but got %s", err)
+	}
+}
+
+func TestIsDurationOperation(t *testing.T) {
+	type Test struct {
+		operation string
+		duration  int
+		expected  bool
+	}
+	tests := []Test{
+		{"get", 5, false},
+		{"put", 0, false},
+		{"put", 1, true},
+		{"multipartput", 5, true},
+		{"options", 10, true},
+	}
+	for _, test := range tests {
+		params := Parameters{
+			Operation: test.operation,
+			Duration:  test.duration,
+		}
+		if params.IsDurationOperation() != test.expected {
+			t.Fatalf("IsDurationOperation with operation=%s and duration=%d should return %v", test.operation, test.duration, test.expected)
+		}
+	}
+}
+
+func TestExactByteSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-size=1231")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatalf("expected no error, but got %v", err)
+	}
+	expect := byteSize(1231)
+	got := config.worklist[0].Size
+	if got != expect {
+		t.Fatalf("expected %v, got %v", expect, got)
+	}
+}
+
+func TestExactPartSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-partsize=15125712")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatalf("expected no error, but got %v", err)
+	}
+	expect := byteSize(15125712)
+	got := config.worklist[0].PartSize
+	if got != expect {
+		t.Fatalf("expected %v, got %v", expect, got)
+	}
+}
+
+func TestMetricByteSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-size=2MB")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatalf("expected no error, but got %v", err)
+	}
+	expect := byteSize(2 * 1000 * 1000)
+	got := config.worklist[0].Size
+	if got != expect {
+		t.Fatalf("expected %v, got %v", expect, got)
+	}
+}
+
+func TestBinaryByteSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-size=2MiB")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatalf("expected no error, but got %v", err)
+	}
+	expect := byteSize(2 * 1024 * 1024)
+	got := config.worklist[0].Size
+	if got != expect {
+		t.Fatalf("expected %v, got %v", expect, got)
+	}
+}
+
+func TestMetricBytePartSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-partsize=5GB")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatalf("expected no error, but got %v", err)
+	}
+	expect := byteSize(5 * 1000 * 1000 * 1000)
+	got := config.worklist[0].PartSize
+	if got != expect {
+		t.Fatalf("expected %v, got %v", expect, got)
+	}
+}
+
+func TestBinaryBytePartSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-partsize=5GiB")
+	config, err := parse(cmdline)
+	if err != nil {
+		t.Fatalf("expected no error, but got %v", err)
+	}
+	expect := byteSize(5 * 1024 * 1024 * 1024)
+	got := config.worklist[0].PartSize
+	if got != expect {
+		t.Fatalf("expected %v, got %v", expect, got)
+	}
+}
+
+func TestInvalidSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-size=3VB")
+	_, err := parse(cmdline)
+	if err == nil {
+		t.Fatalf("expected error, but got none")
+	}
+}
+
+func TestInvalidPartSize(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-partsize=3QB")
+	_, err := parse(cmdline)
+	if err == nil {
+		t.Fatalf("expected error, but got none")
+	}
+}
+
+func TestNegativeSize(t *testing.T) {
+	_, err := parseByteSize("-1")
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
+
+func TestNegativeByteSize(t *testing.T) {
+	_, err := parseByteSize("-23KB")
+	if err == nil {
+		t.Fatalf("expected error, got nil")
 	}
 }

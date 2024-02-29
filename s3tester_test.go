@@ -6,8 +6,9 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -161,7 +161,7 @@ func NewHTTPHelper(tb testing.TB, getResponseBody string, headers map[string]str
 
 		s := ""
 		if r.Body != nil {
-			body, err := ioutil.ReadAll(r.Body)
+			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				tb.Fatal(err)
 			}
@@ -191,7 +191,7 @@ func NewHTTPHelper(tb testing.TB, getResponseBody string, headers map[string]str
 			w.WriteHeader(http.StatusNoContent)
 		}
 	})
-	handle.HandleFunc("/nots3tester", func(w http.ResponseWriter, r *http.Request) {
+	handle.HandleFunc("/not", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
 	ts := httptest.NewServer(handle)
@@ -447,7 +447,7 @@ func TestLoadDefaultCredentialProfileFromFile(t *testing.T) {
 	user1SecretKey := testSecretKey + testSecretKey
 	fileName := "credential_test"
 	fileContent := []byte("[default]\naws_access_key_id=" + testAccessKey + "\naws_secret_access_key=" + testSecretKey + "\n\n" + "[user1]\naws_access_key_id=" + user1AccessKey + "\naws_secret_access_key=" + user1SecretKey)
-	ioutil.WriteFile(fileName, fileContent, 0644)
+	os.WriteFile(fileName, fileContent, 0644)
 	defer os.Remove(fileName)
 	dir, err := os.Getwd()
 	if err != nil {
@@ -477,7 +477,7 @@ func TestLoadCredentialProfileFromFile(t *testing.T) {
 	user1SecretKey := testSecretKey + testSecretKey
 	fileName := "credential_test"
 	fileContent := []byte("[default]\naws_access_key_id=" + testAccessKey + "\naws_secret_access_key=" + testSecretKey + "\n\n" + "[user1]\naws_access_key_id=" + user1AccessKey + "\naws_secret_access_key=" + user1SecretKey)
-	ioutil.WriteFile(fileName, fileContent, 0644)
+	os.WriteFile(fileName, fileContent, 0644)
 	defer os.Remove(fileName)
 	dir, err := os.Getwd()
 	if err != nil {
@@ -656,6 +656,44 @@ func TestMultiEndpointOverwrite2(t *testing.T) {
 	}
 }
 
+func TestConcurrentDurationOperation(t *testing.T) {
+	h := initS3TesterHelper(t, "put")
+	defer h.Shutdown()
+	h.args.Duration = 1
+	h.args.Concurrency = 10
+	h.runTester(t)
+
+	// Initialize a set of expected paths to be run
+	expectedRequestPaths := make(map[string]struct{})
+	for i := 0; i < h.NumRequests(); i++ {
+		path := fmt.Sprintf("/test/object-%d", i)
+		expectedRequestPaths[path] = struct{}{}
+	}
+
+	for i := 0; i < h.NumRequests(); i++ {
+		delete(expectedRequestPaths, h.Request(i).URL.Path)
+	}
+
+	if len(expectedRequestPaths) != 0 {
+		t.Fatalf("Concurrent duration operation should send request to monotonically incrementing keys")
+	}
+}
+
+func TestGETWithDurationAndRequests(t *testing.T) {
+	h := initS3TesterHelper(t, "get")
+	defer h.Shutdown()
+	h.args.Requests = 1
+	h.args.Duration = 1
+
+	start := time.Now()
+	h.runTester(t)
+	elapsed := time.Since(start)
+
+	if elapsed < time.Duration(h.args.Duration)*time.Second || h.NumRequests() <= 1 {
+		t.Fatalf("GET with duration and requests should keep sending requests for duration argument")
+	}
+}
+
 func TestGet(t *testing.T) {
 	h := initS3TesterHelper(t, "get")
 	defer h.Shutdown()
@@ -730,7 +768,7 @@ func TestGetWithVerification(t *testing.T) {
 		h := initS3TesterHelperWithData(t, "get", k)
 		defer h.Shutdown()
 		h.args.Verify = 1
-		h.args.Size = int64(len(k))
+		h.args.Size = byteSize(len(k))
 		testResults := h.runTester(t)
 
 		if h.Request(0).Method != "GET" {
@@ -1218,7 +1256,7 @@ func TestMultipartPutFailureCallsAbort(t *testing.T) {
 
 	// initiate, 1 part, abort
 	if h.Size() != 3 {
-		t.Fatalf("Should received 4 requests. Had %v requests", h.Size())
+		t.Fatalf("Should received 3 requests. Had %v requests", h.Size())
 	}
 
 	if h.Request(0).Method != "POST" {
@@ -1772,10 +1810,11 @@ func TestExecuteValidWorkload(t *testing.T) {
 
 	totalRequest := 0
 	failCount := 0
-	for _, testResult := range testResults {
-		totalRequest += testResult.CumulativeResult.Count
-		failCount += testResult.CumulativeResult.Failcount
-	}
+	testResults.Range(func(r *results) error {
+		totalRequest += r.CumulativeResult.Count
+		failCount += r.CumulativeResult.Failcount
+		return nil
+	})
 
 	checkExpectInt(t, 4, totalRequest)
 	checkExpectInt(t, 0, failCount)
@@ -2089,7 +2128,7 @@ func TestVirtualHostedStyleURL(t *testing.T) {
 	args.AddressingStyle = addressingStyleVirtual
 	svc := MakeS3Service(&httpClient, config, &args, args.Endpoint, credentials.AnonymousCredentials)
 	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
-	Put(svc, args.Bucket, args.Prefix, "", args.Size, make(map[string]*string, 0))
+	Put(context.Background(), svc, args.Bucket, args.Prefix, "", int64(args.Size), make(map[string]*string, 0))
 	if urlSent != expectedVirtualStyleURL {
 		t.Fatalf("URL sent: %s is NOT virtual hosted style: %s", urlSent, expectedVirtualStyleURL)
 	}
@@ -2098,109 +2137,9 @@ func TestVirtualHostedStyleURL(t *testing.T) {
 	args.AddressingStyle = addressingStylePath
 	svc = MakeS3Service(&httpClient, config, &args, args.Endpoint, credentials.AnonymousCredentials)
 	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
-	Put(svc, args.Bucket, args.Prefix, "", args.Size, make(map[string]*string, 0))
+	Put(context.Background(), svc, args.Bucket, args.Prefix, "", int64(args.Size), make(map[string]*string, 0))
 	if urlSent != expectedPathStyleURL {
 		t.Fatalf("URL sent: %s is NOT path style: %s", urlSent, expectedPathStyleURL)
-	}
-}
-
-type mockSyscallParams struct {
-	*SyscallParams
-	testDone                   chan struct{}
-	t                          *testing.T
-	numRequestsSentAtInterrupt int
-}
-
-type mockSyscallCatcher struct {
-	stopWorkers chan struct{}
-}
-
-func (handler *mockSyscallParams) processAndPrintCollectedResults(results *[]results, config *Config, args Parameters) {
-	handler.workersInProgress.Wait()
-	totalRequests := 0
-	for i := 0; i < args.Concurrency; i++ {
-		result := <-handler.results
-		totalRequests += result.Count
-	}
-
-	if totalRequests < handler.numRequestsSentAtInterrupt || totalRequests > args.Requests {
-		handler.t.Errorf("Expected to have %d requests sent in total, but sent: %d",
-			handler.numRequestsSentAtInterrupt, totalRequests)
-	}
-
-	handler.testDone <- struct{}{}
-}
-
-// raise mock syscall after sending 10 requests
-func (catcher *mockSyscallCatcher) run(syscallHandleFunc func()) {
-	<-catcher.stopWorkers
-	syscallHandleFunc()
-}
-
-func TestCaptureDoneResultsOnInterruptSignal(t *testing.T) {
-	numRequestsSentAtInterrupt := 12
-
-	// set up http test server and mock syscall catcher
-	mockSyscallCatcher := mockSyscallCatcher{
-		stopWorkers: make(chan struct{}, 1),
-	}
-	var requests []*http.Request
-
-	mutex := &sync.Mutex{}
-	handler := http.NewServeMux()
-	handler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		mutex.Lock()
-		defer mutex.Unlock()
-		requests = append(requests, r)
-		if len(requests) == numRequestsSentAtInterrupt {
-			mockSyscallCatcher.stopWorkers <- struct{}{}
-		}
-	})
-	testServer := httptest.NewServer(handler)
-	config := testArgs(t, "get", testServer.URL)
-	args := config.worklist[0]
-	args.Requests = 20
-	args.Concurrency = 4
-
-	// set up syscall handler
-	results := make([]results, 0)
-	parentCtx := context.Background()
-	childCtx, cancelChildCtx := context.WithCancel(parentCtx)
-	testDone := make(chan struct{})
-	mockSyscallParams := &mockSyscallParams{
-		SyscallParams:              NewSyscallParams(args),
-		testDone:                   testDone,
-		numRequestsSentAtInterrupt: numRequestsSentAtInterrupt,
-		t:                          t,
-	}
-
-	// run s3tester
-	go mockSyscallCatcher.run(cancelChildCtx)
-	defer cancelChildCtx()
-
-	go attach(childCtx, mockSyscallParams, &results, config, args)
-	runtest(childCtx, config, args, mockSyscallParams)
-	mockSyscallParams.detach()
-
-	// to make sure asserts in test logic has run
-	<-testDone
-}
-
-func TestRunSyscallCatcher(t *testing.T) {
-	didHandlerRun := false
-	wait := make(chan struct{})
-	mockHandler := func() {
-		didHandlerRun = true
-		wait <- struct{}{}
-	}
-
-	syscallCatcher := syscallSignal(make(chan os.Signal))
-	go syscallCatcher.run(mockHandler)
-	syscallCatcher <- syscall.SIGINT
-
-	<-wait
-	if !didHandlerRun {
-		t.Errorf("syscall was raised but handler didn't run.")
 	}
 }
 
@@ -2315,7 +2254,7 @@ func TestRangeReadWithVerify(t *testing.T) {
 			h := initS3TesterHelperWithData(t, "get", responseBody)
 			h.args.Verify = 1
 			h.args.Range = test.contentRange
-			h.args.Size = int64(len(responseBody))
+			h.args.Size = byteSize(len(responseBody))
 			defer h.Shutdown()
 			testResults := h.runTester(t)
 
@@ -2355,7 +2294,7 @@ func TestInvalidRangeReadWithVerify(t *testing.T) {
 			h := initS3TesterHelperWithData(t, "get", responseBody)
 			h.args.Verify = 1
 			h.args.Range = test.contentRange
-			h.args.Size = int64(len(responseBody))
+			h.args.Size = byteSize(len(responseBody))
 			defer h.Shutdown()
 			testResults := h.runTesterWithoutValidation(t)
 
@@ -2369,7 +2308,7 @@ func TestInvalidRangeReadWithVerify(t *testing.T) {
 func TestMultipartPutRangeRead(t *testing.T) {
 	// Multipartput data with partSize=85
 	var multipartPutData = strings.Repeat((strings.Repeat("object-0", 10) + "objec"), 10)
-	var partSize int64 = 85
+	var partSize byteSize = 85
 
 	testData := []struct {
 		contentRange string
@@ -2393,7 +2332,7 @@ func TestMultipartPutRangeRead(t *testing.T) {
 			h.args.Verify = 2
 			h.args.PartSize = partSize
 			h.args.Range = test.contentRange
-			h.args.Size = int64(len(responseBody))
+			h.args.Size = byteSize(len(responseBody))
 			defer h.Shutdown()
 			testResults := h.runTester(t)
 
@@ -2415,11 +2354,11 @@ func TestMultipartPutRangeRead(t *testing.T) {
 func TestMultipartPutNormalRead(t *testing.T) {
 	// Multipartput data with partSize=85
 	var multipartPutData = strings.Repeat((strings.Repeat("object-0", 10) + "objec"), 10)
-	var partSize int64 = 85
+	var partSize byteSize = 85
 
 	h := initS3TesterHelperWithData(t, "get", multipartPutData)
 	h.args.Verify = 2
-	h.args.Size = int64(len(multipartPutData))
+	h.args.Size = byteSize(len(multipartPutData))
 	h.args.PartSize = partSize
 	defer h.Shutdown()
 	testResults := h.runTester(t)
@@ -2533,5 +2472,254 @@ func TestDebugArgument(t *testing.T) {
 	// verify the response body was correctly written back by checking the error message constructed from the error xml
 	if !strings.Contains(buf.String(), "Failed get on object bucket 'test/object-0': BadRequest: BadRequest") {
 		t.Fatalf("Response body was not written back correctly: %s", buf.String())
+	}
+}
+
+func TestCorrectEndpointUniqObjCountWithOverwriteForDurationSetting(t *testing.T) {
+	r := Result{UniqObjNum: 500}
+	p := Parameters{Requests: 2000, endpoints: make([]string, 2)}
+
+	r.correctEndpointUniqObjCountWithOverwriteSetting(3, 1000, &p)
+	if r.UniqObjNum != 500 {
+		t.Fatalf("Got %v, want 500", r.UniqObjNum)
+	}
+
+	r.UniqObjNum = 8000
+	r.correctEndpointUniqObjCountWithOverwriteSetting(3, 1000, &p)
+
+	if r.UniqObjNum != p.Requests/len(p.endpoints) {
+		t.Fatalf("Got %v, want %v", r.UniqObjNum, p.Requests/len(p.endpoints))
+	}
+
+}
+
+func TestCorrectResultsUniqObjCountWithOverwriteForDurationSetting(t *testing.T) {
+	var r results
+	r.CumulativeResult.UniqObjNum = 500
+
+	r.correctResultsUniqObjCountWithOverwriteSetting(3, 1000, 1000)
+	if r.CumulativeResult.UniqObjNum != 500 {
+		t.Fatalf("Got %v, want 500", r.CumulativeResult.UniqObjNum)
+	}
+
+	r.correctResultsUniqObjCountWithOverwriteSetting(3, 1000, 250)
+	if r.CumulativeResult.UniqObjNum != 250 {
+		t.Fatalf("Got %v, want 250", r.CumulativeResult.UniqObjNum)
+	}
+}
+
+func TestGenerateKeyNameBasicSeparate(t *testing.T) {
+	durationRequestCount := new(uint64)
+	keyName1 := generateKeyName("prefix", 4, 1000, 1, 0, 0, "", false, true, false, durationRequestCount)
+	expectedName1 := "prefix-4"
+
+	if expectedName1 != keyName1 {
+		t.Fatalf("Got %v, expected %v", keyName1, expectedName1)
+	}
+
+	keyName2 := generateKeyName("testobject", 77, 2000, 1, 0, 0, "", false, true, false, durationRequestCount)
+	expectedName2 := "testobject-77"
+
+	if expectedName2 != keyName2 {
+		t.Fatalf("Got %v, expected %v", keyName2, expectedName2)
+	}
+}
+
+func TestGenerateKeyNameMultipleWorkersSeparate(t *testing.T) {
+	durationRequestCount := new(uint64)
+	keyName1 := generateKeyName("prefix", 0, 1000, 12, 0, 0, "", false, true, false, durationRequestCount)
+	expectedName1 := "prefix-0"
+
+	if expectedName1 != keyName1 {
+		t.Fatalf("Got %v, expected %v", keyName1, expectedName1)
+	}
+
+	keyName2 := generateKeyName("prefix", 0, 1000, 12, 2, 0, "", false, true, false, durationRequestCount)
+	expectedName2 := "prefix-2000"
+
+	if expectedName2 != keyName2 {
+		t.Fatalf("Got %v, expected %v", keyName2, expectedName2)
+	}
+
+	keyName3 := generateKeyName("prefix", 998, 1000, 12, 3, 0, "", false, true, false, durationRequestCount)
+	expectedName3 := "prefix-3998"
+
+	if expectedName3 != keyName3 {
+		t.Fatalf("Got %v, expected %v", keyName3, expectedName3)
+	}
+
+	keyName4 := generateKeyName("testobject", 7, 444, 10, 3, 0, "", false, true, false, durationRequestCount)
+	expectedName4 := "testobject-1339"
+
+	if expectedName4 != keyName4 {
+		t.Fatalf("Got %v, expected %v", keyName4, expectedName4)
+	}
+}
+
+func TestGenerateKeyNameMultipleWorkersTogether(t *testing.T) {
+	durationRequestCount := new(uint64)
+	keyName1 := generateKeyName("prefix", 0, 1000, 12, 0, 0, "", false, false, false, durationRequestCount)
+	expectedName1 := "prefix-0"
+
+	if expectedName1 != keyName1 {
+		t.Fatalf("Got %v, expected %v", keyName1, expectedName1)
+	}
+
+	keyName2 := generateKeyName("prefix", 0, 1000, 12, 2, 0, "", false, false, false, durationRequestCount)
+	expectedName2 := "prefix-2"
+
+	if expectedName2 != keyName2 {
+		t.Fatalf("Got %v, expected %v", keyName2, expectedName2)
+	}
+
+	keyName3 := generateKeyName("prefix", 998, 1000, 10, 3, 0, "", false, false, false, durationRequestCount)
+	expectedName3 := "prefix-9983"
+
+	if expectedName3 != keyName3 {
+		t.Fatalf("Got %v, expected %v", keyName3, expectedName3)
+	}
+
+	keyName4 := generateKeyName("testobject", 7, 444, 10, 3, 0, "", false, false, false, durationRequestCount)
+	expectedName4 := "testobject-73"
+
+	if expectedName4 != keyName4 {
+		t.Fatalf("Got %v, expected %v", keyName4, expectedName4)
+	}
+}
+
+// overwrite 1
+func TestGenerateKeyNameOverwriteClobberAll(t *testing.T) {
+	durationRequestCount := new(uint64)
+	keyName1 := generateKeyName("onlyname", 0, 1000, 10, 0, 1, "", false, true, false, durationRequestCount)
+	expectedName := "onlyname"
+
+	if expectedName != keyName1 {
+		t.Fatalf("Got %v, expected %v", keyName1, expectedName)
+	}
+
+	keyName2 := generateKeyName("onlyname", 500, 1000, 10, 2, 1, "", false, true, false, durationRequestCount)
+	if expectedName != keyName2 {
+		t.Fatalf("Got %v, expected %v", keyName2, expectedName)
+	}
+
+	keyName3 := generateKeyName("onlyname", 0, 1000, 10, 0, 1, "", false, false, false, durationRequestCount)
+	if expectedName != keyName3 {
+		t.Fatalf("Got %v, expected %v", keyName3, expectedName)
+	}
+
+	keyName4 := generateKeyName("onlyname", 500, 1000, 10, 2, 1, "blah", true, false, false, durationRequestCount)
+	if expectedName != keyName4 {
+		t.Fatalf("Got %v, expected %v", keyName4, expectedName)
+	}
+
+	keyName5 := generateKeyName("onlyname", 500, math.MaxUint64, 10, 2, 1, "blah", true, true, true, durationRequestCount)
+	if expectedName != keyName5 {
+		t.Fatalf("Got %v, expected %v", keyName5, expectedName)
+	}
+}
+
+// overwrite 2
+func TestGenerateKeyNameOverwriteClobberSome(t *testing.T) {
+	durationRequestCount := new(uint64)
+	keyName1 := generateKeyName("prefix", 0, 1000, 10, 0, 2, "", false, true, false, durationRequestCount)
+	expectedName1 := "prefix-0"
+
+	if expectedName1 != keyName1 {
+		t.Fatalf("Got %v, expected %v", keyName1, expectedName1)
+	}
+
+	keyName2 := generateKeyName("prefix", 500, 1000, 10, 2, 2, "", false, true, false, durationRequestCount)
+	expectedName2 := "prefix-500"
+	if expectedName2 != keyName2 {
+		t.Fatalf("Got %v, expected %v", keyName2, expectedName2)
+	}
+
+	keyName3 := generateKeyName("testname", 33, 1000, 10, 0, 2, "", false, false, false, durationRequestCount)
+	expectedName3 := "testname-33"
+	if expectedName3 != keyName3 {
+		t.Fatalf("Got %v, expected %v", keyName3, expectedName3)
+	}
+
+	keyName4 := generateKeyName("testobject", 250, math.MaxUint64, 10, 2, 2, "", false, true, true, durationRequestCount)
+	expectedName4 := "testobject-250"
+	if expectedName4 != keyName4 {
+		t.Fatalf("Got %v, expected %v", keyName4, expectedName4)
+	}
+}
+
+func TestGenerateKeyNameIncrementing(t *testing.T) {
+	durationRequestCount := new(uint64)
+
+	formatString := generateFormatString(0, 998, 9980)
+	keyName := generateKeyName("testobject", 98, 998, 10, 0, 0, formatString, true, true, false, durationRequestCount)
+	expectedName := "testobject-0098"
+	if expectedName != keyName {
+		t.Fatalf("Got %v, expected %v", keyName, expectedName)
+	}
+
+	// separate
+	formatString2 := generateFormatString(0, 500, 6000)
+	keyName2 := generateKeyName("testobject", 47, 500, 12, 3, 0, formatString2, true, true, false, durationRequestCount)
+	expectedName2 := "testobject-1547"
+	if expectedName2 != keyName2 {
+		t.Fatalf("Got %v, expected %v", keyName2, expectedName2)
+	}
+
+	keyName3 := generateKeyName("testobject", 33, 500, 12, 1, 0, formatString2, true, true, false, durationRequestCount)
+	expectedName3 := "testobject-0533"
+	if expectedName3 != keyName3 {
+		t.Fatalf("Got %v, expected %v", keyName3, expectedName3)
+	}
+
+	// together
+	keyName4 := generateKeyName("testname", 1, 500, 12, 3, 0, formatString2, true, false, false, durationRequestCount)
+	expectedName4 := "testname-0015"
+	if expectedName4 != keyName4 {
+		t.Fatalf("Got %v, expected %v", keyName4, expectedName4)
+	}
+
+	keyName5 := generateKeyName("testname", 10, 500, 12, 3, 0, formatString2, true, false, false, durationRequestCount)
+	expectedName5 := "testname-0123"
+	if expectedName5 != keyName5 {
+		t.Fatalf("Got %v, expected %v", keyName5, expectedName5)
+	}
+
+	// test overwrite 2; special case for this
+	formatString3 := generateFormatString(2, 7000, 21000)
+	keyName6 := generateKeyName("overwrite", 123, 7000, 3, 1, 2, formatString3, true, true, false, durationRequestCount)
+	expectedName6 := "overwrite-0123"
+	if expectedName6 != keyName6 {
+		t.Fatalf("Got %v, expected %v", keyName6, expectedName6)
+	}
+}
+
+func TestGenerateKeyNameDuration(t *testing.T) {
+	durationRequestCount := new(uint64)
+
+	formatString := generateFormatString(0, math.MaxUint64, 0) // match normal incoming arguments for "duration"
+	keyName := generateKeyName("duration", 2020, math.MaxUint64, 3, 1, 0, formatString, false, true, true, durationRequestCount)
+	expectedName := "duration-0"
+	if expectedName != keyName {
+		t.Fatalf("Got %v, expected %v", keyName, expectedName)
+	}
+
+	// should increment based on the durationRequestCount, most of the other arguments don't matter (except overwrite, which overrides duration)
+	keyName2 := generateKeyName("duration", 2023, math.MaxUint64, 12, 4, 0, formatString, false, false, true, durationRequestCount)
+	expectedName2 := "duration-1"
+	if expectedName2 != keyName2 {
+		t.Fatalf("Got %v, expected %v", keyName2, expectedName2)
+	}
+
+	*durationRequestCount += uint64(1000)
+	keyName3 := generateKeyName("duration", 2024, math.MaxUint64, 9, 0, 0, formatString, false, true, true, durationRequestCount)
+	expectedName3 := "duration-1002"
+	if expectedName3 != keyName3 {
+		t.Fatalf("Got %v, expected %v", keyName3, expectedName3)
+	}
+
+	keyName4 := generateKeyName("duration", 1998, math.MaxUint64, 11, 0, 0, formatString, true, true, true, durationRequestCount)
+	expectedName4 := "duration-00000000000000001003"
+	if expectedName4 != keyName4 {
+		t.Fatalf("Got %v, expected %v", keyName4, expectedName4)
 	}
 }

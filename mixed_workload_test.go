@@ -70,10 +70,9 @@ func TestGenerateRequestsPutGet(t *testing.T) {
 		{Operation: "get", Ratio: 50, sent: 0, ops: 2}}
 
 	keys := map[string]uint64{"nottestobject-0": 0, "nottestobject-1": 1}
-	buckets := map[string]bool{"nots3tester": true}
 	var wg *sync.WaitGroup
 	workers := createChannels(2, wg)
-	params := &workloadParams{hashKeys: keys, bucketMap: buckets, workersChanSlice: workers, concurrency: len(workers)}
+	params := &workloadParams{hashKeys: keys, workersChanSlice: workers, concurrency: len(workers)}
 
 	opsReceived := make([][]s3op, 2)
 
@@ -110,10 +109,9 @@ func TestGenerateRequestsPutGetDelete(t *testing.T) {
 	}
 
 	keys := map[string]uint64{}
-	buckets := map[string]bool{"nots3tester": true}
 	var wg *sync.WaitGroup
 	workers := createChannels(4, wg)
-	params := &workloadParams{hashKeys: keys, bucketMap: buckets, workersChanSlice: workers, concurrency: len(workers)}
+	params := &workloadParams{hashKeys: keys, workersChanSlice: workers, concurrency: len(workers)}
 
 	generateRequests(&args, ratios, params)
 	closeAllWorkerChannels(workers)
