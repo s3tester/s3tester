@@ -706,8 +706,11 @@ func calcStats(results *Result, concurrency int, elapsedTime time.Duration) {
 		results.NominalRequestsPerSec = 1.0 / mean.Seconds() * float64(concurrency)
 		results.ActualRequestsPerSec = float64(results.Count) / elapsedTime.Seconds()
 		results.ContentThroughput = float64(results.TotalObjectSize) / 1024 / 1024 / elapsedTime.Seconds()
-		results.AverageObjectSize = float64(results.TotalObjectSize) / float64(results.Count)
-	}	
+		results.AverageObjectSize = 0
+		if (results.Count - results.Failcount) > 0 {
+			results.AverageObjectSize = float64(results.TotalObjectSize) / float64(results.Count-results.Failcount)
+		}
+	}
 }
 
 func roundResult(results *Result) {
