@@ -692,9 +692,9 @@ func setupResultStat(testResult *Result) {
 	roundResult(testResult)
 	processPercentiles(testResult)
 
+	testResult.TotalElapsedTime = float64(elapsedTime.Milliseconds())
 	minReqTime := time.Duration(testResult.latencies.Min() * 1e4)
 	maxReqTime := time.Duration(testResult.latencies.Max() * 1e4)
-	testResult.TotalElapsedTime = float64(elapsedTime) / float64(time.Millisecond)
 	testResult.MinimumRequestTime = float64(minReqTime) / float64(time.Millisecond)
 	testResult.MaximumRequestTime = float64(maxReqTime) / float64(time.Millisecond)
 }
