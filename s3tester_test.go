@@ -382,11 +382,15 @@ func generateErrorXML(tb testing.TB, code string) (response string) {
 }
 
 func TestLoadAnonymousCredential(t *testing.T) {
-	cre, err := loadCredentialProfile("", true)
+	config := testArgs(t, "put", "www.example.com:18082")
+	args := config.worklist[0]
+	args.NoSignRequest = true
+	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
+		t.Fatal("Error creating S3 service", err)
 	}
-	if cre != credentials.AnonymousCredentials {
-		t.Fatalf("not standard anonymous credentials")
+	if svc.Config.Credentials != credentials.AnonymousCredentials {
+		t.Fatalf("not standard anonymous credentials: %v", svc.Config.Credentials)
 	}
 }
 
@@ -395,23 +399,31 @@ func TestLoadEnvCredential(t *testing.T) {
 	testSecretKey := testAccessKey + "/" + testAccessKey
 	os.Setenv(accessKey, testAccessKey)
 	os.Setenv(secretKey, testSecretKey)
-	cre, err := loadCredentialProfile("", false)
+
+	config := testArgs(t, "put", "www.example.com:18082")
+	args := config.worklist[0]
+	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
-		t.Fatalf("Error loading env credentials")
+		t.Fatal("Error creating S3 service", err)
 	}
-	val, err := cre.Get()
+
+	val, err := svc.Config.Credentials.Get()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("error getting Credential", err)
 	}
+
 	if val.AccessKeyID != testAccessKey || val.SecretAccessKey != testSecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
-	if val.ProviderName != "EnvProvider" {
-		t.Fatalf("Expecting it to use EnvProvider, but it's using %s", val.ProviderName)
+	if val.ProviderName != "EnvConfigCredentials" {
+		t.Fatalf("Expecting it to use EnvConfigCredentials, but it's using %s", val.ProviderName)
 	}
 }
 
 func TestLoadDefaultCliCredential(t *testing.T) {
+	config := testArgs(t, "put", "www.example.com:18082")
+	args := config.worklist[0]
+
 	os.Setenv(accessKey, "")
 	os.Setenv(secretKey, "")
 	defaultPath := ""
@@ -424,16 +436,20 @@ func TestLoadDefaultCliCredential(t *testing.T) {
 		defaultPath = "\\user\\.aws\\credentials"
 	}
 	if _, err := os.Stat(defaultPath); os.IsNotExist(err) {
-		_, err := loadCredentialProfile("", false)
+		args.Profile = ""
+		_, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
 		if err == nil {
 			t.Fatalf("No credential should be loaded")
 		}
-		_, err = loadCredentialProfile("test", false)
+
+		args.Profile = "test"
+		_, err = MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
 		if err == nil {
 			t.Fatalf("No credential should be loaded")
 		}
 	} else {
-		_, err := loadCredentialProfile("", false)
+		args.Profile = ""
+		_, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
 		if err != nil {
 			t.Fatalf("Default credential should be loaded")
 		}
@@ -441,6 +457,8 @@ func TestLoadDefaultCliCredential(t *testing.T) {
 }
 
 func TestLoadDefaultCredentialProfileFromFile(t *testing.T) {
+	config := testArgs(t, "put", "www.example.com:18082")
+	args := config.worklist[0]
 	testAccessKey := "testkey"
 	user1AccessKey := testAccessKey + testAccessKey
 	testSecretKey := testAccessKey + "/" + testAccessKey
@@ -454,19 +472,20 @@ func TestLoadDefaultCredentialProfileFromFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Setenv("AWS_SHARED_CREDENTIALS_FILE", dir+"/"+fileName)
-	cre, err := loadCredentialProfile("", false)
+	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
-		t.Fatalf("Error loading test file")
+		t.Fatal("Error creating S3 service", err)
 	}
-	val, err := cre.Get()
+
+	val, err := svc.Config.Credentials.Get()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if val.AccessKeyID != testAccessKey || val.SecretAccessKey != testSecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
-	if val.ProviderName != "SharedCredentialsProvider" {
-		t.Fatalf("Expecting it to use SharedCredentialsProvider, but it's using %s", val.ProviderName)
+	if !strings.HasPrefix(val.ProviderName, "SharedConfigCredentials") {
+		t.Fatalf("Expecting it to use SharedConfigCredentials, but it's using %s", val.ProviderName)
 	}
 }
 
@@ -484,19 +503,23 @@ func TestLoadCredentialProfileFromFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Setenv("AWS_SHARED_CREDENTIALS_FILE", dir+"/"+fileName)
-	cre, err := loadCredentialProfile("user1", false)
+
+	config := testArgs(t, "put", "www.example.com:18082")
+	args := config.worklist[0]
+	args.Profile = "user1"
+	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
-		t.Fatalf("Error loading test file")
+		t.Fatal("Error creating S3 service", err)
 	}
-	val, err := cre.Get()
+	val, err := svc.Config.Credentials.Get()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if val.AccessKeyID != user1AccessKey || val.SecretAccessKey != user1SecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
-	if val.ProviderName != "SharedCredentialsProvider" {
-		t.Fatalf("Expecting it to use SharedCredentialsProvider, but it's using %s", val.ProviderName)
+	if !strings.HasPrefix(val.ProviderName, "SharedConfigCredentials") {
+		t.Fatalf("Expecting it to use SharedConfigCredentials, but it's using %s", val.ProviderName)
 	}
 }
 
@@ -2126,7 +2149,10 @@ func TestVirtualHostedStyleURL(t *testing.T) {
 
 	// Run with virtual style enabled
 	args.AddressingStyle = addressingStyleVirtual
-	svc := MakeS3Service(&httpClient, config, &args, args.Endpoint, credentials.AnonymousCredentials)
+	svc, err := MakeS3Service(&httpClient, config, &args, args.Endpoint)
+	if err != nil {
+		t.Fatalf("Error creating S3 service: %v", err)
+	}
 	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
 	Put(context.Background(), svc, args.Bucket, args.Prefix, "", int64(args.Size), make(map[string]*string, 0))
 	if urlSent != expectedVirtualStyleURL {
@@ -2135,7 +2161,10 @@ func TestVirtualHostedStyleURL(t *testing.T) {
 
 	// Run with virtual style disabled (= forced path style)
 	args.AddressingStyle = addressingStylePath
-	svc = MakeS3Service(&httpClient, config, &args, args.Endpoint, credentials.AnonymousCredentials)
+	svc, err = MakeS3Service(&httpClient, config, &args, args.Endpoint)
+	if err != nil {
+		t.Fatalf("Error creating S3 service: %v", err)
+	}
 	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
 	Put(context.Background(), svc, args.Bucket, args.Prefix, "", int64(args.Size), make(map[string]*string, 0))
 	if urlSent != expectedPathStyleURL {
