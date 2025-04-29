@@ -283,15 +283,10 @@ type work struct {
 	startTime            time.Time
 	limiter              *rate.Limiter
 	workerChan           *workerChan
-	credential           *credentials.Credentials
 	durationRequestCount *uint64
 }
 
 func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args Parameters, sysInterruptHandler SyscallHandler) {
-	credential, err := loadCredentialProfile(args.Profile, args.NoSignRequest)
-	if err != nil {
-		log.Fatalf("Failed loading credentials.\nPlease specify env variable AWS_SHARED_CREDENTIALS_FILE if you put credential file other than AWS CLI configuration directory: %v", err)
-	}
 	limiter := rate.NewLimiter(args.ratePerSecond, 1)
 	workersPerEndpoint := args.Concurrency / len(args.endpoints)
 	var workerChans []*workerChan
@@ -311,7 +306,7 @@ func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args 
 		workerChans = createChannels(args.Concurrency, &workersWG)
 
 		go func() {
-			if err := SetupOps(&args, workerChans, credential, mixedWorkloadDecoder); err != nil {
+			if err := SetupOps(&args, workerChans, mixedWorkloadDecoder); err != nil {
 				log.Fatalf("Failed to generate requests: %v", err)
 			}
 			closeAllWorkerChannels(workerChans)
@@ -344,7 +339,6 @@ func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args 
 				startTime:            endpointStartTime,
 				limiter:              limiter,
 				workerChan:           workChan,
-				credential:           credential,
 				durationRequestCount: durationRequestCount,
 			}
 
@@ -354,20 +348,6 @@ func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args 
 	if mixedWorkloadDecoder != nil {
 		workersWG.Wait()
 	}
-}
-
-func loadCredentialProfile(profile string, nosign bool) (*credentials.Credentials, error) {
-	if nosign {
-		return credentials.AnonymousCredentials, nil
-	}
-	providers := make([]credentials.Provider, 0)
-	if profile == "" {
-		providers = append(providers, &credentials.EnvProvider{})
-	}
-	providers = append(providers, &credentials.SharedCredentialsProvider{Profile: profile})
-	credential := credentials.NewChainCredentials(providers)
-	_, err := credential.Get() // invoke it here as a validation of loading credentials
-	return credential, err
 }
 
 func generateFormatString(overwrite int, maxRequestsPerWorker uint64, requests uint64) string {
@@ -465,8 +445,10 @@ func sendRequest(ctx context.Context, svc *s3.S3, httpClient *http.Client, opTyp
 
 func worker(ctx context.Context, results chan<- Result, config *Config, args Parameters, work *work, sysInterruptHandler SyscallHandler) {
 	httpClient := MakeHTTPClient()
-	svc := MakeS3Service(httpClient, config, &args, work.endpoint, work.credential)
-	var source *rand.Rand
+	svc, err := MakeS3Service(httpClient, config, &args, work.endpoint)
+	if err != nil {
+		log.Fatalf("failed to create S3 service client: %v", err)
+	}
 
 	r := NewResult()
 	r.Endpoint = work.endpoint
@@ -482,6 +464,7 @@ func worker(ctx context.Context, results chan<- Result, config *Config, args Par
 		r.data = make([]detail, 0, args.Requests/(args.Concurrency)*args.attempts)
 	}
 
+	var source *rand.Rand
 	if args.hasRandomSize() {
 		source = rand.New(rand.NewSource(args.max - args.min))
 	}
@@ -1076,13 +1059,20 @@ func MakeHTTPClient() *http.Client {
 }
 
 // MakeS3Service creates a new Amazon S3 session from the given parameters
-func MakeS3Service(client *http.Client, config *Config, args *Parameters, endpoint string, credentials *credentials.Credentials) *s3.S3 {
+func MakeS3Service(client *http.Client, config *Config, args *Parameters, endpoint string) (*s3.S3, error) {
 	s3Config := aws.NewConfig().
 		WithRegion(args.Region).
-		WithCredentials(credentials).
 		WithEndpoint(endpoint).
 		WithHTTPClient(client).
 		WithDisableComputeChecksums(true)
+
+	// Setting this environment variable to disable EC2 metadata lookup.
+	// Without this, session will ping EC2 metadata service and timeout after 2 minutes when other credentials doesn't exist
+	os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	if args.NoSignRequest {
+		s3Config.WithCredentials(credentials.AnonymousCredentials)
+	}
 	if args.AddressingStyle == addressingStylePath {
 		s3Config.WithS3ForcePathStyle(true)
 	}
@@ -1091,9 +1081,25 @@ func MakeS3Service(client *http.Client, config *Config, args *Parameters, endpoi
 	} else {
 		s3Config.Retryer = NewRetryerWithSleep(config.Retries, config.RetrySleep)
 	}
-	s3Session, err := session.NewSession(s3Config)
+	s3Session, err := session.NewSessionWithOptions(session.Options{
+		Config:            *s3Config,
+		Profile:           args.Profile,
+		SharedConfigState: session.SharedConfigEnable,
+	})
 	if err != nil {
-		log.Fatal("Failed to create an S3 session", err)
+		return nil, fmt.Errorf("failed to create an S3 session: %v", err)
+	}
+
+	// Session will lookup credentials in following order:
+	// 1. Environment variables
+	// 2. Shared credentials file (~/.aws/credentials)
+	// 3. Shared configuration file (~/.aws/config)
+	// Invoking Get() here as a validation of loading credentials
+	if !args.NoSignRequest {
+		_, err := s3Session.Config.Credentials.Get()
+		if err != nil {
+			return nil, fmt.Errorf("failed loading credentials.\nPlease specify env variable AWS_SHARED_CREDENTIALS_FILE if you put credential file other than AWS CLI configuration directory: %v", err)
+		}
 	}
 
 	svc := s3.New(s3Session)
@@ -1157,7 +1163,7 @@ func MakeS3Service(client *http.Client, config *Config, args *Parameters, endpoi
 		})
 	}
 
-	return svc
+	return svc, nil
 }
 
 // Reads the first 1000 bytes of the response body for printing to stderr, and restores the response body so it can still be read elsewhere
