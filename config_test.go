@@ -239,6 +239,15 @@ func TestNotAllowDurationAndUnsupportedOps(t *testing.T) {
 	}
 }
 
+func TestNotAllowDurationAndMixedWorkloadOps(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-duration=1", "-mixed-workload=/path/to/the-workload-file.json")
+	_, err := parse(cmdline)
+
+	if err == nil {
+		t.Fatalf("duration and mixed-workload cannot both be set")
+	}
+}
+
 func TestRepeatMustBeGreaterThanZero(t *testing.T) {
 	cmdline := generateValidCmdlineSetting("-repeat=-1")
 	_, err := parse(cmdline)
