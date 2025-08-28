@@ -1,4 +1,13 @@
 # Changelog
+## v3.1.1
+### Added
+- support for AssumeRole credential
+
+### Changed
+- fixed panic that could occur when interrupted by SIGINT
+- fixed reported average object size incorrect when requests fail
+- prevent incompatible duration and mixed-workload arguments from being used together
+
 ## v3.1.0
 ### Added
 - environment variable S3TESTER_PRINT_RESPONSE_HEADERS can be specified to print specific response header values when request fails
