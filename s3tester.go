@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -33,6 +34,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/smithy-go"
 	"golang.org/x/time/rate"
 )
 
@@ -174,10 +176,14 @@ type detail struct {
 
 // IsErrorRetryable returns true if the request that threw the given error can be retried
 func IsErrorRetryable(err error) bool {
-	if err != nil {
-		if err, ok := err.(awserr.Error); ok {
-			// inconsistency can lead to a multipart complete not seeing a part just uploaded.
-			return err.Code() == "InvalidPart"
+	if err == nil {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		// Example: retry on "InvalidPart" error code
+		if apiErr.ErrorCode() == "InvalidPart" {
+			return true
 		}
 	}
 	return false
