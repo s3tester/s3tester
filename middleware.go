@@ -1,32 +1,30 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log"
+	"net/url"
+	"os"
 	"strings"
-	"testing"
 
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+)
+
+var (
+	_ middleware.BuildMiddleware       = (*addCustomHeader)(nil)
+	_ middleware.BuildMiddleware       = (*addHeaders)(nil)
+	_ middleware.BuildMiddleware       = (*addQuery)(nil)
+	_ middleware.DeserializeMiddleware = (*printResponseHeaders)(nil)
+	_ middleware.DeserializeMiddleware = (*debugErrorResponse)(nil)
 )
 
 type addCustomHeader struct {
 	header, val string
 }
-
-type unsignedPayloadMiddleware struct{}
-
-type captureHost struct {
-	testbench *testing.T
-	expect    string
-}
-
-var (
-	_ middleware.BuildMiddleware    = (*addCustomHeader)(nil)
-	_ middleware.BuildMiddleware    = (*unsignedPayloadMiddleware)(nil)
-	_ middleware.FinalizeMiddleware = (*removeAwsChunked)(nil)
-)
 
 func (m *addCustomHeader) ID() string {
 	return "addCustomHeader-" + m.header
@@ -54,100 +52,197 @@ func AddCustomHeader(header, val string) func(*middleware.Stack) error {
 	}
 }
 
-func (m *unsignedPayloadMiddleware) ID() string {
-	return "UnsignedPayloadMiddleware"
+type addHeaders struct {
+	headers headerFlags
 }
 
-func (m *unsignedPayloadMiddleware) HandleBuild(
-	ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler,
-) (
+func (m *addHeaders) ID() string {
+	return "addHeaders"
+}
+
+func (m *addHeaders) HandleBuild(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
 	out middleware.BuildOutput, metadata middleware.Metadata, err error,
 ) {
-	// Assign via context as assigning it in the header will cause
-	// SignatureDoesNotMatch errors due to signing
-	ctx = v4.SetPayloadHash(ctx, "UNSIGNED-PAYLOAD")
+	req, ok := in.Request.(*smithyhttp.Request)
+	if !ok {
+		return out, metadata, fmt.Errorf("unrecognized transport type %T", in.Request)
+	}
+
+	userAgent := userAgentString + req.Header.Get("User-Agent")
+	req.Header.Set("User-Agent", userAgent)
+
+	for k, v := range m.headers {
+		req.Header.Set(k, v)
+	}
 
 	return next.HandleBuild(ctx, in)
 }
 
-func UnsignedPayloadMiddleware() func(*middleware.Stack) error {
+func AddHeaders(headers headerFlags) func(*middleware.Stack) error {
 	return func(s *middleware.Stack) error {
-		return s.Build.Add(&unsignedPayloadMiddleware{}, middleware.After)
+		return s.Build.Add(&addHeaders{
+			headers: headers,
+		}, middleware.After) // must be called last as User-Agent is populated first by the SDK
 	}
 }
 
-func (m *captureHost) ID() string {
-	return "CaptureHost"
+type addQuery struct {
+	query string
 }
 
-func (m *captureHost) HandleFinalize(
-	ctx context.Context,
-	in middleware.FinalizeInput,
-	next middleware.FinalizeHandler,
-) (out middleware.FinalizeOutput, metadata middleware.Metadata, err error) {
-	m.testbench.Helper()
+func (m *addQuery) ID() string {
+	return "addQuery"
+}
 
+func (m *addQuery) HandleBuild(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
+	out middleware.BuildOutput, metadata middleware.Metadata, err error,
+) {
 	req, ok := in.Request.(*smithyhttp.Request)
 	if !ok {
-		m.testbench.Logf("Middleware CaptureHost: unable to cast request to *smithyhttp.Request")
-		return next.HandleFinalize(ctx, in)
+		return out, metadata, fmt.Errorf("unrecognized transport type %T", in.Request)
 	}
 
-	if req.Host != m.expect {
-		m.testbench.Errorf("Unexpected Host: got %s, expected %s", req.Host, m.expect)
+	if m.query != "" {
+		q := req.URL.Query()
+		values, err := url.ParseQuery(m.query)
+		if err != nil {
+			log.Fatalf("Unable to parse query params: %v", err)
+		}
+
+		for k, v := range values {
+			for _, s := range v {
+				q.Add(k, s)
+			}
+		}
+		req.URL.RawQuery = q.Encode()
 	}
 
-	return next.HandleFinalize(ctx, in)
+	return next.HandleBuild(ctx, in)
 }
 
-func CaptureHost(t *testing.T, tc string) func(*middleware.Stack) error {
+func AddQuery(query string) func(*middleware.Stack) error {
 	return func(s *middleware.Stack) error {
-		return s.Finalize.Add(&captureHost{testbench: t, expect: tc}, middleware.After)
+		return s.Build.Add(&addQuery{
+			query: query,
+		}, middleware.After)
 	}
 }
 
-type removeAwsChunked struct{}
-
-func (m *removeAwsChunked) ID() string {
-	return "RemoveAwsChunked"
+type printResponseHeaders struct {
+	headers []string
 }
 
-func (m *removeAwsChunked) HandleFinalize(
-	ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler,
-) (out middleware.FinalizeOutput, metadata middleware.Metadata, err error) {
-	req, ok := in.Request.(*smithyhttp.Request)
-	if !ok {
-		return next.HandleFinalize(ctx, in)
+func (m *printResponseHeaders) ID() string {
+	return "printResponseHeaders"
+}
+
+func (m *printResponseHeaders) HandleDeserialize(
+	ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler,
+) (
+	out middleware.DeserializeOutput, metadata middleware.Metadata, err error,
+) {
+	// Call next middleware first to get the response
+	out, metadata, err = next.HandleDeserialize(ctx, in)
+
+	resp, ok := out.RawResponse.(*smithyhttp.Response)
+	if !ok || resp == nil {
+		// No HTTP response available, nothing to do
+		return out, metadata, err
 	}
 
-	ce := req.Header.Get("Content-Encoding")
-	if ce == "" {
-		// No Content-Encoding header, nothing to do
-		return next.HandleFinalize(ctx, in)
-	}
-
-	encodings := strings.Split(ce, ",")
-	filtered := make([]string, 0, len(encodings))
-	for _, enc := range encodings {
-		enc = strings.TrimSpace(enc)
-		if strings.ToLower(enc) != "aws-chunked" {
-			filtered = append(filtered, enc)
+	// Only print headers if status code is NOT 2xx
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Println("Response Header Report:")
+		for _, header := range m.headers {
+			// Use http.Header.Get or Values to get all values for the header
+			values := resp.Header.Values(header)
+			if len(values) > 0 {
+				fmt.Fprintf(os.Stderr, "\t%s : %v\n", header, values)
+			}
 		}
 	}
 
-	if len(filtered) == 0 {
-		req.Header.Del("Content-Encoding")
-	} else {
-		req.Header.Set("Content-Encoding", strings.Join(filtered, ", "))
-	}
-
-	return next.HandleFinalize(ctx, in)
+	return out, metadata, err
 }
 
-func RemoveAwsChunked() func(*middleware.Stack) error {
+// AddPrintResponseHeaders returns a middleware stack option that adds the printResponseHeaders middleware
+func AddPrintResponseHeaders(envVar string) func(*middleware.Stack) error {
+	headersEnv := os.Getenv(envVar)
+	if len(headersEnv) == 0 {
+		// No headers to print, no middleware needed
+		return func(s *middleware.Stack) error { return nil }
+	}
+
+	var printedHeaders []string
+	for _, header := range strings.Split(headersEnv, ";") {
+		if h := strings.TrimSpace(header); len(h) > 0 {
+			printedHeaders = append(printedHeaders, h)
+		}
+	}
+	if len(printedHeaders) == 0 {
+		return func(s *middleware.Stack) error { return nil }
+	}
+
 	return func(s *middleware.Stack) error {
-		// Must be added before the Signing middleware to prevent overwriting
-		// as the SDK will repeatedly set aws-chunked in Build and Finalize stages
-		return s.Finalize.Insert(&removeAwsChunked{}, "Signing", middleware.Before)
+		return s.Deserialize.Add(&printResponseHeaders{
+			headers: printedHeaders,
+		}, middleware.After)
+	}
+}
+
+type debugErrorResponse struct{}
+
+func (m *debugErrorResponse) ID() string {
+	return "debugErrorResponse"
+}
+
+func (m *debugErrorResponse) HandleDeserialize(
+	ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler,
+) (
+	out middleware.DeserializeOutput, metadata middleware.Metadata, err error,
+) {
+	// Access the HTTP response before calling next to avoid consuming the body too early
+	resp, ok := out.RawResponse.(*smithyhttp.Response)
+	if !ok || resp == nil {
+		// No HTTP response, just continue
+		return next.HandleDeserialize(ctx, in)
+	}
+
+	// Read and buffer the body only if status code is not 2xx
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var buf bytes.Buffer
+		// Read the body
+		if resp.Body != nil {
+			_, err := io.Copy(&buf, resp.Body)
+			if err != nil {
+				log.Printf("failed to read error response body: %v", err)
+			}
+			// Close original body
+			resp.Body.Close()
+		}
+
+		// Replace the body with a new ReadCloser so downstream can read it again
+		resp.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
+
+		// Log the error response body (remove newlines)
+		log.Printf("request %v %v not successful: %v %v",
+			resp.Request.Method,
+			resp.Request.URL.EscapedPath(),
+			resp.StatusCode,
+			strings.ReplaceAll(buf.String(), "\n", ""),
+		)
+	}
+
+	// Call next middleware with the (possibly replaced) response
+	return next.HandleDeserialize(ctx, in)
+}
+
+// AddDebugErrorResponseMiddleware returns a middleware stack option that adds the debug error response logger
+func AddDebugErrorResponseMiddleware(enabled bool) func(*middleware.Stack) error {
+	if !enabled {
+		return func(s *middleware.Stack) error { return nil }
+	}
+	return func(s *middleware.Stack) error {
+		return s.Deserialize.Add(&debugErrorResponse{}, middleware.Before)
 	}
 }
