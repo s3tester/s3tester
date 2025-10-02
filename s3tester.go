@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -30,7 +29,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awsConfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go/aws/request"
 	"golang.org/x/time/rate"
 )
 
@@ -1046,24 +1044,13 @@ func MakeS3Service(ctx context.Context, client *http.Client, config *Config, arg
 		AddHeaders(args.Header),
 		AddQuery(args.QueryParams),
 		AddPrintResponseHeaders(os.Getenv(s3TesterPrintResponseHeaderEnv)),
-		AddDebugErrorResponseMiddleware(config.Debug),
+		AddDebugErrorResponseMiddleware(true),
 	)
 
 	// Create the S3 client
 	s3Client := s3.NewFromConfig(awsCfg, s3Options...)
 
 	return s3Client, nil
-}
-
-// Reads the first 1000 bytes of the response body for printing to stderr, and restores the response body so it can still be read elsewhere
-func readErrorResponse(r *request.Request) ([]byte, error) {
-	buffer := make([]byte, 1000)
-	_, err := r.HTTPResponse.Body.Read(buffer)
-	r.HTTPResponse.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buffer), r.HTTPResponse.Body))
-	if err == io.EOF {
-		return buffer, nil
-	}
-	return buffer, err
 }
 
 // HistogramSummary will generate a power of 2 histogram summary where every successive bin is 2x the last one.

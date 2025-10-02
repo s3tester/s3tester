@@ -82,7 +82,7 @@ func AddHeaders(headers headerFlags) func(*middleware.Stack) error {
 	return func(s *middleware.Stack) error {
 		return s.Build.Add(&addHeaders{
 			headers: headers,
-		}, middleware.After) // must be called last as User-Agent is populated first by the SDK
+		}, middleware.After)
 	}
 }
 
@@ -141,20 +141,16 @@ func (m *printResponseHeaders) HandleDeserialize(
 ) (
 	out middleware.DeserializeOutput, metadata middleware.Metadata, err error,
 ) {
-	// Call next middleware first to get the response
 	out, metadata, err = next.HandleDeserialize(ctx, in)
 
 	resp, ok := out.RawResponse.(*smithyhttp.Response)
 	if !ok || resp == nil {
-		// No HTTP response available, nothing to do
 		return out, metadata, err
 	}
 
-	// Only print headers if status code is NOT 2xx
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Println("Response Header Report:")
 		for _, header := range m.headers {
-			// Use http.Header.Get or Values to get all values for the header
 			values := resp.Header.Values(header)
 			if len(values) > 0 {
 				fmt.Fprintf(os.Stderr, "\t%s : %v\n", header, values)
@@ -165,11 +161,9 @@ func (m *printResponseHeaders) HandleDeserialize(
 	return out, metadata, err
 }
 
-// AddPrintResponseHeaders returns a middleware stack option that adds the printResponseHeaders middleware
 func AddPrintResponseHeaders(envVar string) func(*middleware.Stack) error {
 	headersEnv := os.Getenv(envVar)
 	if len(headersEnv) == 0 {
-		// No headers to print, no middleware needed
 		return func(s *middleware.Stack) error { return nil }
 	}
 
@@ -201,30 +195,23 @@ func (m *debugErrorResponse) HandleDeserialize(
 ) (
 	out middleware.DeserializeOutput, metadata middleware.Metadata, err error,
 ) {
-	// Access the HTTP response before calling next to avoid consuming the body too early
 	resp, ok := out.RawResponse.(*smithyhttp.Response)
 	if !ok || resp == nil {
-		// No HTTP response, just continue
 		return next.HandleDeserialize(ctx, in)
 	}
 
-	// Read and buffer the body only if status code is not 2xx
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var buf bytes.Buffer
-		// Read the body
 		if resp.Body != nil {
 			_, err := io.Copy(&buf, resp.Body)
 			if err != nil {
 				log.Printf("failed to read error response body: %v", err)
 			}
-			// Close original body
 			resp.Body.Close()
 		}
 
-		// Replace the body with a new ReadCloser so downstream can read it again
 		resp.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
 
-		// Log the error response body (remove newlines)
 		log.Printf("request %v %v not successful: %v %v",
 			resp.Request.Method,
 			resp.Request.URL.EscapedPath(),
@@ -233,11 +220,9 @@ func (m *debugErrorResponse) HandleDeserialize(
 		)
 	}
 
-	// Call next middleware with the (possibly replaced) response
 	return next.HandleDeserialize(ctx, in)
 }
 
-// AddDebugErrorResponseMiddleware returns a middleware stack option that adds the debug error response logger
 func AddDebugErrorResponseMiddleware(enabled bool) func(*middleware.Stack) error {
 	if !enabled {
 		return func(s *middleware.Stack) error { return nil }
