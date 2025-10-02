@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +12,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -26,19 +25,16 @@ import (
 	"time"
 
 	"github.com/HdrHistogram/hdrhistogram-go"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awsConfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"golang.org/x/time/rate"
 )
 
 const (
 	// VERSION is displayed with help, bump when updating
-	VERSION = "3.1.0"
+	VERSION = "3.1.1"
 	// for identifying s3tester requests in the user-agent header
 	userAgentString = "s3tester/"
 
@@ -170,72 +166,6 @@ func (r *Result) RecordLatency(l time.Duration) {
 type detail struct {
 	ts      time.Time
 	elapsed time.Duration
-}
-
-// IsErrorRetryable returns true if the request that threw the given error can be retried
-func IsErrorRetryable(err error) bool {
-	if err != nil {
-		if err, ok := err.(awserr.Error); ok {
-			// inconsistency can lead to a multipart complete not seeing a part just uploaded.
-			return err.Code() == "InvalidPart"
-		}
-	}
-	return false
-}
-
-// CustomRetryer is a wrapper struct for the default SDK retryer
-type CustomRetryer struct {
-	maxRetries     int
-	defaultRetryer request.Retryer
-}
-
-// ShouldRetry returns true if a given failed request is retryable
-func (d CustomRetryer) ShouldRetry(r *request.Request) bool {
-	if IsErrorRetryable(r.Error) {
-		return true
-	}
-	return d.defaultRetryer.ShouldRetry(r)
-}
-
-// RetryRules returns the length of time to sleep in between retries of failed requests
-func (d CustomRetryer) RetryRules(r *request.Request) time.Duration {
-	return d.defaultRetryer.RetryRules(r)
-}
-
-// MaxRetries returns the max number of retries
-func (d CustomRetryer) MaxRetries() int {
-	return d.maxRetries
-}
-
-// NewCustomRetryer constructs a CustomRetryer, allowing configuration of the max number of retries to perform on failure
-func NewCustomRetryer(retries int) *CustomRetryer {
-	return &CustomRetryer{maxRetries: retries, defaultRetryer: client.DefaultRetryer{NumMaxRetries: retries}}
-}
-
-// RetryerWithSleep supplements CustomRetryer with a configurable sleep period
-type RetryerWithSleep struct {
-	base               *CustomRetryer
-	retrySleepPeriodMs int
-}
-
-// RetryRules returns the sleep period in between retries
-func (d RetryerWithSleep) RetryRules(r *request.Request) time.Duration {
-	return time.Millisecond * time.Duration(d.retrySleepPeriodMs)
-}
-
-// ShouldRetry returns true if a given failed request is retryable
-func (d RetryerWithSleep) ShouldRetry(r *request.Request) bool {
-	return d.base.ShouldRetry(r)
-}
-
-// MaxRetries returns the max number of retries
-func (d RetryerWithSleep) MaxRetries() int {
-	return d.base.MaxRetries()
-}
-
-// NewRetryerWithSleep constructs a new RetryerWithSleep, allowing configuration of the max number of retries on failure and the length of time to sleep in between retries
-func NewRetryerWithSleep(retries int, sleepPeriodMs int) *RetryerWithSleep {
-	return &RetryerWithSleep{retrySleepPeriodMs: sleepPeriodMs, base: NewCustomRetryer(retries)}
 }
 
 func randMinMax(source *rand.Rand, min int64, max int64) int64 {
@@ -402,7 +332,7 @@ func generateKeyName(prefix string, counter uint64, maxRequestsPerWorker uint64,
 }
 
 // ReceiveS3Op receives s3 operations from the mixed workload decoder and dispatches them
-func ReceiveS3Op(ctx context.Context, svc *s3.S3, httpClient *http.Client, args *Parameters, durationLimit *DurationSetting, limiter *rate.Limiter, workersChan *workerChan, r *Result, sysInterruptHandler SyscallHandler, debug bool) {
+func ReceiveS3Op(ctx context.Context, svc *s3.Client, httpClient *http.Client, args *Parameters, durationLimit *DurationSetting, limiter *rate.Limiter, workersChan *workerChan, r *Result, sysInterruptHandler SyscallHandler, debug bool) {
 	for op := range workersChan.workChan {
 		args.Size = byteSize(op.Size)
 		args.Bucket = op.Bucket
@@ -418,12 +348,14 @@ func ReceiveS3Op(ctx context.Context, svc *s3.S3, httpClient *http.Client, args 
 	workersChan.wg.Done()
 }
 
-func sendRequest(ctx context.Context, svc *s3.S3, httpClient *http.Client, opType string, keyName string, args *Parameters, r *Result, limiter *rate.Limiter, sysInterruptHandler SyscallHandler, debug bool) {
+func sendRequest(ctx context.Context, svc *s3.Client, httpClient *http.Client, opType string, keyName string, args *Parameters, r *Result, limiter *rate.Limiter, sysInterruptHandler SyscallHandler, debug bool) {
 	start := time.Now()
+	var canceledErr *aws.RequestCanceledError
+
 	err := DispatchOperation(ctx, svc, httpClient, opType, keyName, args, r, int64(args.Requests), sysInterruptHandler, debug)
 	elapsed := time.Since(start)
 	r.RecordLatency(elapsed)
-	if aerr, ok := err.(awserr.Error); ok && aerr.Code() == request.CanceledErrorCode {
+	if errors.As(err, &canceledErr) && canceledErr.CanceledError() {
 		r.CancelledCount++
 	} else if err != nil {
 		r.Failcount++
@@ -445,7 +377,7 @@ func sendRequest(ctx context.Context, svc *s3.S3, httpClient *http.Client, opTyp
 
 func worker(ctx context.Context, results chan<- Result, config *Config, args Parameters, work *work, sysInterruptHandler SyscallHandler) {
 	httpClient := MakeHTTPClient()
-	svc, err := MakeS3Service(httpClient, config, &args, work.endpoint)
+	svc, err := MakeS3Service(ctx, httpClient, config, &args, work.endpoint)
 	if err != nil {
 		log.Fatalf("failed to create S3 service client: %v", err)
 	}
@@ -785,13 +717,13 @@ func executeTester(ctx context.Context, config *Config) *Results {
 
 // SyscallHandler is an interface for exiting the program cleanly when a system interrupt is captured
 type SyscallHandler interface {
-	contextCancelListener(ctx context.Context, svc *s3.S3, testResult *Result, args *Parameters, resultWG *sync.WaitGroup)
+	contextCancelListener(ctx context.Context, svc *s3.Client, testResult *Result, args *Parameters, resultWG *sync.WaitGroup)
 	detach()
 	setTestStartTime(time time.Time)
 	addWorker()
 	addMultipartUpload(key, bucket string, uploadID string)
 	doneMultipartUpload(key, bucket string, uploadID string)
-	abortMultipartRequests(svc *s3.S3)
+	abortMultipartRequests(ctx context.Context, svc *s3.Client)
 	done() <-chan struct{}
 }
 
@@ -852,13 +784,13 @@ func (handler *SyscallParams) done() <-chan struct{} {
 
 // When context is cancelled, save test result that has been run so far.
 // Exit if test is done (= handler detached)
-func (handler *SyscallParams) contextCancelListener(ctx context.Context, svc *s3.S3, testResult *Result, args *Parameters, resultWG *sync.WaitGroup) {
+func (handler *SyscallParams) contextCancelListener(ctx context.Context, svc *s3.Client, testResult *Result, args *Parameters, resultWG *sync.WaitGroup) {
 	defer handler.workersInProgress.Done()
 
 	select {
 	case <-ctx.Done():
 		if args.Operation == "multipartput" {
-			handler.abortMultipartRequests(svc)
+			handler.abortMultipartRequests(ctx, svc)
 		}
 		resultWG.Wait()
 		handler.results <- *testResult
@@ -867,7 +799,7 @@ func (handler *SyscallParams) contextCancelListener(ctx context.Context, svc *s3
 	}
 }
 
-func (handler *SyscallParams) abortMultipartRequests(svc *s3.S3) {
+func (handler *SyscallParams) abortMultipartRequests(ctx context.Context, svc *s3.Client) {
 	handler.mpUploadsMutex.Lock()
 	defer handler.mpUploadsMutex.Unlock()
 
@@ -877,7 +809,7 @@ func (handler *SyscallParams) abortMultipartRequests(svc *s3.S3) {
 			Key:      aws.String(handler.multipartUploads[uploadID][1]),
 			UploadId: aws.String(uploadID),
 		}
-		_, err := svc.AbortMultipartUpload(params)
+		_, err := svc.AbortMultipartUpload(ctx, params)
 		if err != nil {
 			log.Printf("Failed to abort multipart upload on system interrupt: %s", err)
 		}
@@ -1059,122 +991,66 @@ func MakeHTTPClient() *http.Client {
 }
 
 // MakeS3Service creates a new Amazon S3 session from the given parameters
-func MakeS3Service(client *http.Client, config *Config, args *Parameters, endpoint string) (*s3.S3, error) {
-	s3Config := aws.NewConfig().
-		WithRegion(args.Region).
-		WithEndpoint(endpoint).
-		WithHTTPClient(client).
-		WithDisableComputeChecksums(true)
-
+func MakeS3Service(ctx context.Context, client *http.Client, config *Config, args *Parameters, endpoint string) (*s3.Client, error) {
 	// Setting this environment variable to disable EC2 metadata lookup.
 	// Without this, session will ping EC2 metadata service and timeout after 2 minutes when other credentials doesn't exist
 	os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
+	loadOptions := []func(*awsConfig.LoadOptions) error{
+		awsConfig.WithRegion(args.Region),
+		awsConfig.WithHTTPClient(client),
+		awsConfig.WithBaseEndpoint(endpoint),
+		awsConfig.WithSharedConfigProfile(args.Profile),
+	}
+
 	if args.NoSignRequest {
-		s3Config.WithCredentials(credentials.AnonymousCredentials)
+		loadOptions = append(loadOptions, awsConfig.WithCredentialsProvider(aws.AnonymousCredentials{}))
 	}
-	if args.AddressingStyle == addressingStylePath {
-		s3Config.WithS3ForcePathStyle(true)
-	}
-	if config.RetrySleep == 0 {
-		s3Config.Retryer = NewCustomRetryer(config.Retries)
-	} else {
-		s3Config.Retryer = NewRetryerWithSleep(config.Retries, config.RetrySleep)
-	}
-	s3Session, err := session.NewSessionWithOptions(session.Options{
-		Config:            *s3Config,
-		Profile:           args.Profile,
-		SharedConfigState: session.SharedConfigEnable,
-	})
+
+	// Load AWS config
+	awsCfg, err := awsConfig.LoadDefaultConfig(ctx, loadOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create an S3 session: %v", err)
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	// Session will lookup credentials in following order:
-	// 1. Environment variables
-	// 2. Shared credentials file (~/.aws/credentials)
-	// 3. Shared configuration file (~/.aws/config)
-	// Invoking Get() here as a validation of loading credentials
 	if !args.NoSignRequest {
-		_, err := s3Session.Config.Credentials.Get()
+		_, err := awsCfg.Credentials.Retrieve(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed loading credentials.\nPlease specify env variable AWS_SHARED_CREDENTIALS_FILE if you put credential file other than AWS CLI configuration directory: %v", err)
+			return nil, fmt.Errorf("failed loading credentials. \nPlease specify env variable AWS_SHARED_CREDENTIALS_FILE if you put credential file other than AWS CLI configuration directory: %v", err)
 		}
 	}
 
-	svc := s3.New(s3Session)
-
-	svc.Client.Handlers.Send.PushFront(func(r *request.Request) {
-		userAgent := userAgentString + r.HTTPRequest.UserAgent()
-		r.HTTPRequest.Header.Set("User-Agent", userAgent)
-		for key, value := range args.Header {
-			r.HTTPRequest.Header.Set(key, value)
-		}
-	})
-
-	svc.Client.Handlers.Build.PushFront(func(r *request.Request) {
-		if args.QueryParams != "" {
-			q := r.HTTPRequest.URL.Query()
-			values, err := url.ParseQuery(args.QueryParams)
-			if err != nil {
-				log.Fatalf("Unable to parse query params: %v", err)
-			}
-
-			for k, v := range values {
-				for _, s := range v {
-					q.Add(k, s)
-				}
-			}
-			r.HTTPRequest.URL.RawQuery = q.Encode()
-		}
-	})
-
-	if headers := os.Getenv(s3TesterPrintResponseHeaderEnv); len(headers) > 0 {
-		var printedHeaders []string
-		for _, header := range strings.Split(headers, ";") {
-			if header = strings.TrimSpace(header); len(header) > 0 {
-				printedHeaders = append(printedHeaders, header)
-			}
-		}
-		if len(printedHeaders) > 0 {
-			svc.Client.Handlers.CompleteAttempt.PushFront(func(r *request.Request) {
-				if r.HTTPResponse.StatusCode < 200 || r.HTTPResponse.StatusCode >= 300 {
-					log.Println("Response Header Report:")
-					for _, header := range printedHeaders {
-						if v, ok := r.HTTPResponse.Header[header]; ok {
-							fmt.Fprintf(os.Stderr, "\t%s : %v\n", header, v)
-						}
-					}
-				}
-			})
-		}
+	s3Options := []func(*s3.Options){
+		func(o *s3.Options) {
+			o.Retryer = retry.AddWithErrorCodes(o.Retryer, "InvalidPart")
+			o.Retryer = retry.AddWithMaxAttempts(o.Retryer, config.Retries)
+		},
 	}
 
-	if config.Debug {
-		svc.Client.Handlers.UnmarshalMeta.PushBack(func(r *request.Request) {
-			if r.HTTPResponse.StatusCode < 200 || r.HTTPResponse.StatusCode >= 300 {
-				b, err := readErrorResponse(r)
-				if err != nil {
-					log.Printf("request %v %v not successful: %v %v", r.HTTPRequest.Method, r.HTTPRequest.URL.EscapedPath(), r.HTTPResponse.StatusCode, err)
-				} else {
-					log.Printf("request %v %v not successful: %v %v", r.HTTPRequest.Method, r.HTTPRequest.URL.EscapedPath(), r.HTTPResponse.StatusCode, strings.ReplaceAll(string(b), "\n", ""))
-				}
-			}
+	// Force path style addressing if needed
+	if args.AddressingStyle == addressingStylePath {
+		s3Options = append(s3Options, func(o *s3.Options) {
+			o.UsePathStyle = true
 		})
 	}
 
-	return svc, nil
-}
-
-// Reads the first 1000 bytes of the response body for printing to stderr, and restores the response body so it can still be read elsewhere
-func readErrorResponse(r *request.Request) ([]byte, error) {
-	buffer := make([]byte, 1000)
-	_, err := r.HTTPResponse.Body.Read(buffer)
-	r.HTTPResponse.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buffer), r.HTTPResponse.Body))
-	if err == io.EOF {
-		return buffer, nil
+	if config.RetrySleep > 0 {
+		s3Options = append(s3Options, func(o *s3.Options) {
+			o.Retryer = retry.AddWithMaxBackoffDelay(o.Retryer, time.Millisecond*time.Duration(config.Retries))
+		})
 	}
-	return buffer, err
+
+	awsCfg.APIOptions = append(awsCfg.APIOptions,
+		AddHeaders(args.Header),
+		AddQuery(args.QueryParams),
+		AddPrintResponseHeaders(os.Getenv(s3TesterPrintResponseHeaderEnv)),
+		AddDebugErrorResponseMiddleware(true),
+	)
+
+	// Create the S3 client
+	s3Client := s3.NewFromConfig(awsCfg, s3Options...)
+
+	return s3Client, nil
 }
 
 // HistogramSummary will generate a power of 2 histogram summary where every successive bin is 2x the last one.
