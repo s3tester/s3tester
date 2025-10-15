@@ -34,7 +34,7 @@ import (
 
 const (
 	// VERSION is displayed with help, bump when updating
-	VERSION = "3.1.1"
+	VERSION = "3.2.0"
 	// for identifying s3tester requests in the user-agent header
 	userAgentString = "s3tester/"
 
@@ -1036,7 +1036,7 @@ func MakeS3Service(ctx context.Context, client *http.Client, config *Config, arg
 
 	if config.RetrySleep > 0 {
 		s3Options = append(s3Options, func(o *s3.Options) {
-			o.Retryer = retry.AddWithMaxBackoffDelay(o.Retryer, time.Millisecond*time.Duration(config.Retries))
+			o.Retryer = retry.AddWithMaxBackoffDelay(o.Retryer, time.Millisecond*time.Duration(config.RetrySleep))
 		})
 	}
 
