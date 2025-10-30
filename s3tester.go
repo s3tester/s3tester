@@ -29,6 +29,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awsConfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"golang.org/x/time/rate"
 )
 
@@ -990,6 +992,16 @@ func MakeHTTPClient() *http.Client {
 	}
 }
 
+func WithContentMD5Option() func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		stack.Initialize.Remove("AWSChecksum:SetupInputContext")
+		stack.Build.Remove("AWSChecksum:RequestMetricsTracking")
+		stack.Finalize.Remove("AWSChecksum:ComputeInputPayloadChecksum")
+		stack.Finalize.Remove("addInputChecksumTrailer")
+		return smithyhttp.AddContentChecksumMiddleware(stack)
+	}
+}
+
 // MakeS3Service creates a new Amazon S3 session from the given parameters
 func MakeS3Service(ctx context.Context, client *http.Client, config *Config, args *Parameters, endpoint string) (*s3.Client, error) {
 	// Setting this environment variable to disable EC2 metadata lookup.
@@ -1044,7 +1056,8 @@ func MakeS3Service(ctx context.Context, client *http.Client, config *Config, arg
 		AddHeaders(args.Header),
 		AddQuery(args.QueryParams),
 		AddPrintResponseHeaders(os.Getenv(s3TesterPrintResponseHeaderEnv)),
-		AddDebugErrorResponseMiddleware(true),
+		AddDebugErrorResponseMiddleware(config.Debug),
+		WithContentMD5Option(),
 	)
 
 	// Create the S3 client
