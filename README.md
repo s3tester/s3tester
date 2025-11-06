@@ -13,8 +13,6 @@ This tool is in active development - please submit feature requests in the issue
 ```
 $ go get github.com/s3tester/s3tester
 ```
-	
-If you don't want to build from source you can download the compiled version of s3tester for Windows or Linux from [github.com/s3tester/s3tester/releases](https://www.github.com/s3tester/s3tester/releases)
 
 ## Usage
 
