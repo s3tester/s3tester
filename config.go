@@ -452,6 +452,10 @@ func setupParam(args *Parameters) error {
 		if !isRequestsSet && !args.IsDurationOperation() {
 			return fmt.Errorf("Using duration without requests is not supported for operation %q", args.Operation)
 		}
+
+		if args.MixedWorkload != "" {
+			return errors.New("Duration not supported for mixed-workload")
+		}
 	}
 
 	if args.Wait < 0 {

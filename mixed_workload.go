@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/aws/aws-sdk-go/aws/credentials"
 )
 
 type s3op struct {
@@ -40,12 +38,11 @@ type workloadParams struct {
 	// workersChanSlice is an s3 operation channel for each worker
 	workersChanSlice []*workerChan
 	concurrency      int
-	credentials      *credentials.Credentials
 }
 
-func setupWorkloadParams(workerChans []*workerChan, concurrency int, credential *credentials.Credentials) *workloadParams {
+func setupWorkloadParams(workerChans []*workerChan, concurrency int) *workloadParams {
 	keys := make(map[string]uint64)
-	return &workloadParams{hashKeys: keys, workersChanSlice: workerChans, concurrency: concurrency, credentials: credential}
+	return &workloadParams{hashKeys: keys, workersChanSlice: workerChans, concurrency: concurrency}
 }
 
 func closeAllWorkerChannels(workChanSlice []*workerChan) {
@@ -55,7 +52,7 @@ func closeAllWorkerChannels(workChanSlice []*workerChan) {
 }
 
 // SetupOps reads in json file to a struct to determine which s3 operations to generate and then execute
-func SetupOps(args *Parameters, workerChans []*workerChan, credential *credentials.Credentials, decoder *json.Decoder) error {
+func SetupOps(args *Parameters, workerChans []*workerChan, decoder *json.Decoder) error {
 	if _, err := decoder.Token(); err != nil {
 		return err
 	}
@@ -67,7 +64,7 @@ func SetupOps(args *Parameters, workerChans []*workerChan, credential *credentia
 		return errors.New("Incorrect workload type specified, must be 'mixedWorkload'")
 	}
 
-	workloadParams := setupWorkloadParams(workerChans, args.Concurrency, credential)
+	workloadParams := setupWorkloadParams(workerChans, args.Concurrency)
 	MixedWorkload(args, workloadParams, decoder)
 	return nil
 }
