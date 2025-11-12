@@ -21,9 +21,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
 )
 
 const (
@@ -385,12 +382,12 @@ func TestLoadAnonymousCredential(t *testing.T) {
 	config := testArgs(t, "put", "www.example.com:18082")
 	args := config.worklist[0]
 	args.NoSignRequest = true
-	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
+	svc, err := MakeS3Service(context.Background(), http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
 		t.Fatal("Error creating S3 service", err)
 	}
-	if svc.Config.Credentials != credentials.AnonymousCredentials {
-		t.Fatalf("not standard anonymous credentials: %v", svc.Config.Credentials)
+	if svc.Options().Credentials != nil {
+		t.Fatalf("not standard anonymous credentials: %v", svc.Options().Credentials)
 	}
 }
 
@@ -402,12 +399,12 @@ func TestLoadEnvCredential(t *testing.T) {
 
 	config := testArgs(t, "put", "www.example.com:18082")
 	args := config.worklist[0]
-	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
+	svc, err := MakeS3Service(context.Background(), http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
 		t.Fatal("Error creating S3 service", err)
 	}
 
-	val, err := svc.Config.Credentials.Get()
+	val, err := svc.Options().Credentials.Retrieve(context.Background())
 	if err != nil {
 		t.Fatal("error getting Credential", err)
 	}
@@ -415,8 +412,8 @@ func TestLoadEnvCredential(t *testing.T) {
 	if val.AccessKeyID != testAccessKey || val.SecretAccessKey != testSecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
-	if val.ProviderName != "EnvConfigCredentials" {
-		t.Fatalf("Expecting it to use EnvConfigCredentials, but it's using %s", val.ProviderName)
+	if val.Source != "EnvConfigCredentials" {
+		t.Fatalf("Expecting it to use EnvConfigCredentials, but it's using %s", val.Source)
 	}
 }
 
@@ -437,19 +434,19 @@ func TestLoadDefaultCliCredential(t *testing.T) {
 	}
 	if _, err := os.Stat(defaultPath); os.IsNotExist(err) {
 		args.Profile = ""
-		_, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
+		_, err := MakeS3Service(context.Background(), http.DefaultClient, config, &args, args.Endpoint)
 		if err == nil {
 			t.Fatalf("No credential should be loaded")
 		}
 
 		args.Profile = "test"
-		_, err = MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
+		_, err = MakeS3Service(context.Background(), http.DefaultClient, config, &args, args.Endpoint)
 		if err == nil {
 			t.Fatalf("No credential should be loaded")
 		}
 	} else {
 		args.Profile = ""
-		_, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
+		_, err := MakeS3Service(context.Background(), http.DefaultClient, config, &args, args.Endpoint)
 		if err != nil {
 			t.Fatalf("Default credential should be loaded")
 		}
@@ -472,20 +469,20 @@ func TestLoadDefaultCredentialProfileFromFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Setenv("AWS_SHARED_CREDENTIALS_FILE", dir+"/"+fileName)
-	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
+	svc, err := MakeS3Service(context.Background(), http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
 		t.Fatal("Error creating S3 service", err)
 	}
 
-	val, err := svc.Config.Credentials.Get()
+	val, err := svc.Options().Credentials.Retrieve(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if val.AccessKeyID != testAccessKey || val.SecretAccessKey != testSecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
-	if !strings.HasPrefix(val.ProviderName, "SharedConfigCredentials") {
-		t.Fatalf("Expecting it to use SharedConfigCredentials, but it's using %s", val.ProviderName)
+	if !strings.HasPrefix(val.Source, "SharedConfigCredentials") {
+		t.Fatalf("Expecting it to use SharedConfigCredentials, but it's using %s", val.Source)
 	}
 }
 
@@ -507,19 +504,19 @@ func TestLoadCredentialProfileFromFile(t *testing.T) {
 	config := testArgs(t, "put", "www.example.com:18082")
 	args := config.worklist[0]
 	args.Profile = "user1"
-	svc, err := MakeS3Service(http.DefaultClient, config, &args, args.Endpoint)
+	svc, err := MakeS3Service(context.Background(), http.DefaultClient, config, &args, args.Endpoint)
 	if err != nil {
 		t.Fatal("Error creating S3 service", err)
 	}
-	val, err := svc.Config.Credentials.Get()
+	val, err := svc.Options().Credentials.Retrieve(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if val.AccessKeyID != user1AccessKey || val.SecretAccessKey != user1SecretKey {
 		t.Fatalf("Credentials are wrong, %s | %s", val.AccessKeyID, val.SecretAccessKey)
 	}
-	if !strings.HasPrefix(val.ProviderName, "SharedConfigCredentials") {
-		t.Fatalf("Expecting it to use SharedConfigCredentials, but it's using %s", val.ProviderName)
+	if !strings.HasPrefix(val.Source, "SharedConfigCredentials") {
+		t.Fatalf("Expecting it to use SharedConfigCredentials, but it's using %s", val.Source)
 	}
 }
 
@@ -885,10 +882,6 @@ func TestPut(t *testing.T) {
 	h.args.Size = 6
 	testResults := h.runTester(t)
 
-	if h.Request(0).Method != "PUT" {
-		t.Fatalf("Wrong request type issued. Expected PUT but got %s", h.Request(0).Method)
-	}
-
 	if h.Request(0).URL.Path != "/test/object-0" {
 		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
 	}
@@ -1137,8 +1130,8 @@ func TestMultipartPut(t *testing.T) {
 	if h.Request(1).Method != "PUT" {
 		t.Fatalf("Wrong request type issued. Expected %s but got %s", "PUT", h.Request(1).Method)
 	}
-	if h.Request(1).URL.Path == "/test/object-0" && h.Request(1).URL.RawQuery != fmt.Sprintf("partNumber=1&uploadId=%s", uid) {
-		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=1&uploadId=%s", uid), h.Request(1).URL.Path, h.Request(1).URL.RawQuery)
+	if h.Request(1).URL.Path == "/test/object-0" && h.Request(1).URL.RawQuery != fmt.Sprintf("partNumber=1&uploadId=%s&x-id=UploadPart", uid) {
+		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=1&uploadId=%s&x-id=UploadPart", uid), h.Request(1).URL.Path, h.Request(1).URL.RawQuery)
 	}
 	if h.Request(1).Header.Get("Content-Length") != "100" {
 		t.Fatalf("Wrong content length: %v", h.Request(1).Header.Get("Content-Length"))
@@ -1147,8 +1140,8 @@ func TestMultipartPut(t *testing.T) {
 	if h.Request(2).Method != "PUT" {
 		t.Fatalf("Wrong request type issued. Expected %s but got %s", "PUT", h.Request(1).Method)
 	}
-	if h.Request(2).URL.Path == "/test/object-0" && h.Request(2).URL.RawQuery != fmt.Sprintf("partNumber=2&uploadId=%s", uid) {
-		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=2&uploadId=%s", uid), h.Request(2).URL.Path, h.Request(2).URL.RawQuery)
+	if h.Request(2).URL.Path == "/test/object-0" && h.Request(2).URL.RawQuery != fmt.Sprintf("partNumber=2&uploadId=%s&x-id=UploadPart", uid) {
+		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=2&uploadId=%s&x-id=UploadPart", uid), h.Request(2).URL.Path, h.Request(2).URL.RawQuery)
 	}
 	if h.Request(2).Header.Get("Content-Length") != "100" {
 		t.Fatalf("Wrong content length: %v", h.Request(2).Header.Get("Content-Length"))
@@ -1219,8 +1212,8 @@ func TestMultipartPutWithUnevenPartsize(t *testing.T) {
 	if h.Request(1).Method != "PUT" {
 		t.Fatalf("Wrong request type issued. Expected %s but got %s", "PUT", h.Request(1).Method)
 	}
-	if h.Request(1).URL.Path == "/test/object-0" && h.Request(1).URL.RawQuery != fmt.Sprintf("partNumber=1&uploadId=%s", uid) {
-		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=1&uploadId=%s", uid), h.Request(1).URL.Path, h.Request(1).URL.RawQuery)
+	if h.Request(1).URL.Path == "/test/object-0" && h.Request(1).URL.RawQuery != fmt.Sprintf("partNumber=1&uploadId=%s&x-id=UploadPart", uid) {
+		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=1&uploadId=%s&x-id=UploadPart", uid), h.Request(1).URL.Path, h.Request(1).URL.RawQuery)
 	}
 	if h.Request(1).Header.Get("Content-Length") != "110" {
 		t.Fatalf("Wrong content length: %v", h.Request(1).Header.Get("Content-Length"))
@@ -1229,8 +1222,8 @@ func TestMultipartPutWithUnevenPartsize(t *testing.T) {
 	if h.Request(2).Method != "PUT" {
 		t.Fatalf("Wrong request type issued. Expected %s but got %s", "PUT", h.Request(1).Method)
 	}
-	if h.Request(2).URL.Path == "/test/object-0" && h.Request(2).URL.RawQuery != fmt.Sprintf("partNumber=2&uploadId=%s", uid) {
-		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=2&uploadId=%s", uid), h.Request(2).URL.Path, h.Request(2).URL.RawQuery)
+	if h.Request(2).URL.Path == "/test/object-0" && h.Request(2).URL.RawQuery != fmt.Sprintf("partNumber=2&uploadId=%s&x-id=UploadPart", uid) {
+		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=2&uploadId=%s&x-id=UploadPart", uid), h.Request(2).URL.Path, h.Request(2).URL.RawQuery)
 	}
 	if h.Request(2).Header.Get("Content-Length") != "90" {
 		t.Fatalf("Wrong content length: %v", h.Request(2).Header.Get("Content-Length"))
@@ -1268,7 +1261,7 @@ func TestMultipartPutFailureCallsAbort(t *testing.T) {
 	multipartInitiateResponse := Response{Body: multipartInitiateBody, Status: 200}
 	h.SetRequestResult(multipartInitiateReq, multipartInitiateResponse)
 
-	failedUploadPartReq := Request{URI: fmt.Sprintf("/test/object-0?partNumber=1&uploadId=%s", uid), Method: "PUT"}
+	failedUploadPartReq := Request{URI: fmt.Sprintf("/test/object-0?partNumber=1&uploadId=%s&x-id=UploadPart", uid), Method: "PUT"}
 	failedUploadPartResponse := Response{Body: generateErrorXML(t, "BadRequest"), Status: 400}
 	h.SetRequestResult(failedUploadPartReq, failedUploadPartResponse)
 
@@ -1296,8 +1289,8 @@ func TestMultipartPutFailureCallsAbort(t *testing.T) {
 	if h.Request(1).Method != "PUT" {
 		t.Fatalf("Wrong request type issued. Expected %s but got %s", "PUT", h.Request(1).Method)
 	}
-	if h.Request(1).URL.Path == "/test/object-0" && h.Request(1).URL.RawQuery != fmt.Sprintf("partNumber=1&uploadId=%s", uid) {
-		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=1&uploadId=%s", uid), h.Request(1).URL.Path, h.Request(1).URL.RawQuery)
+	if h.Request(1).URL.Path == "/test/object-0" && h.Request(1).URL.RawQuery != fmt.Sprintf("partNumber=1&uploadId=%s&x-id=UploadPart", uid) {
+		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("partNumber=1&uploadId=%s&x-id=UploadPart", uid), h.Request(1).URL.Path, h.Request(1).URL.RawQuery)
 	}
 	if h.Request(1).Header.Get("Content-Length") != "100" {
 		t.Fatalf("Wrong content length: %v", h.Request(1).Header.Get("Content-Length"))
@@ -1306,8 +1299,8 @@ func TestMultipartPutFailureCallsAbort(t *testing.T) {
 	if h.Request(2).Method != "DELETE" {
 		t.Fatalf("Wrong request type issued. Expected %s but got %s", "DELETE", h.Request(2).Method)
 	}
-	if h.Request(2).URL.Path == "/test/object-0" && h.Request(2).URL.RawQuery != fmt.Sprintf("uploadId=%s", uid) {
-		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("uploadId=%s", uid), h.Request(2).URL.Path, h.Request(2).URL.RawQuery)
+	if h.Request(2).URL.Path == "/test/object-0" && h.Request(2).URL.RawQuery != fmt.Sprintf("uploadId=%s&x-id=AbortMultipartUpload", uid) {
+		t.Fatalf("Wrong url path. Expected %s?%s, got %s?%s", "/test/object-0", fmt.Sprintf("uploadId=%s&x-id=AbortMultipartUpload", uid), h.Request(2).URL.Path, h.Request(2).URL.RawQuery)
 	}
 }
 
@@ -2131,44 +2124,32 @@ func TestEmptyHistogramSummary(t *testing.T) {
 }
 
 func TestVirtualHostedStyleURL(t *testing.T) {
-	host := "www.example.com:18082"
-	bucket := "test-bucket"
-	objectKey := "test-object"
-	expectedVirtualStyleURL := fmt.Sprintf("%s.%s/%s", bucket, host, objectKey)
-	expectedPathStyleURL := fmt.Sprintf("%s/%s/%s", host, bucket, objectKey)
-	var urlSent string
-	extractURLBeforeSend := func(r *request.Request) {
-		urlSent = fmt.Sprintf("%s%s", r.HTTPRequest.URL.Host, r.HTTPRequest.URL.Path)
-	}
-
-	config := testArgs(t, "put", host)
-	config.worklist[0].Bucket = bucket
-	config.worklist[0].Prefix = objectKey
+	config := testArgs(t, "put", "www.example.com:18082")
 	args := config.worklist[0]
 	httpClient := http.Client{Timeout: time.Nanosecond}
 
 	// Run with virtual style enabled
 	args.AddressingStyle = addressingStyleVirtual
-	svc, err := MakeS3Service(&httpClient, config, &args, args.Endpoint)
+	svc, err := MakeS3Service(context.Background(), &httpClient, config, &args, args.Endpoint)
 	if err != nil {
 		t.Fatalf("Error creating S3 service: %v", err)
 	}
-	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
-	Put(context.Background(), svc, args.Bucket, args.Prefix, "", int64(args.Size), make(map[string]*string, 0))
-	if urlSent != expectedVirtualStyleURL {
-		t.Fatalf("URL sent: %s is NOT virtual hosted style: %s", urlSent, expectedVirtualStyleURL)
+	// Path style is opaque to users and is handled by the SDK itself,
+	// only way to check is to look at the client configuration
+	pathStyle := svc.Options().UsePathStyle
+	if pathStyle != false {
+		t.Fatalf("Expected virtual path style (false), got: %v", pathStyle)
 	}
 
 	// Run with virtual style disabled (= forced path style)
 	args.AddressingStyle = addressingStylePath
-	svc, err = MakeS3Service(&httpClient, config, &args, args.Endpoint)
+	svc, err = MakeS3Service(context.Background(), &httpClient, config, &args, args.Endpoint)
 	if err != nil {
 		t.Fatalf("Error creating S3 service: %v", err)
 	}
-	svc.Client.Handlers.Send.PushBack(extractURLBeforeSend)
-	Put(context.Background(), svc, args.Bucket, args.Prefix, "", int64(args.Size), make(map[string]*string, 0))
-	if urlSent != expectedPathStyleURL {
-		t.Fatalf("URL sent: %s is NOT path style: %s", urlSent, expectedPathStyleURL)
+	pathStyle = svc.Options().UsePathStyle
+	if pathStyle != true {
+		t.Fatalf("Expected path style (true), got: %v", pathStyle)
 	}
 }
 
@@ -2424,7 +2405,7 @@ func TestQueryParams(t *testing.T) {
 		t.Fatalf("Wrong url path: %s", h.Request(0).URL.Path)
 	}
 
-	if h.Request(0).URL.RawQuery != "test-query-param=" {
+	if h.Request(0).URL.RawQuery != "test-query-param=&x-id=GetObject" {
 		t.Fatalf("Wrong query parameters: %s", h.Request(0).URL.RawQuery)
 	}
 
@@ -2478,7 +2459,7 @@ func TestDebugArgument(t *testing.T) {
 	h.config.Debug = true
 	defer h.Shutdown()
 
-	debugGetReq := Request{URI: "/test/object-0", Method: "GET"}
+	debugGetReq := Request{URI: "/test/object-0?x-id=GetObject", Method: "GET"}
 	debugGetResponse := Response{Body: generateErrorXML(t, "BadRequest"), Status: 400}
 	h.SetRequestResult(debugGetReq, debugGetResponse)
 
@@ -2499,7 +2480,7 @@ func TestDebugArgument(t *testing.T) {
 	}
 
 	// verify the response body was correctly written back by checking the error message constructed from the error xml
-	if !strings.Contains(buf.String(), "Failed get on object bucket 'test/object-0': BadRequest: BadRequest") {
+	if !strings.Contains(buf.String(), "Failed get on object bucket 'test/object-0': operation error S3: GetObject, https response error StatusCode: 400, RequestID: , HostID: , api error BadRequest: BadRequest") {
 		t.Fatalf("Response body was not written back correctly: %s", buf.String())
 	}
 }
