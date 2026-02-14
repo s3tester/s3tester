@@ -1,4 +1,8 @@
 # Changelog
+## v3.2.0
+### Changed
+- migrated from aws sdk go v1 to aws sdk go v2
+
 ## v3.1.1
 ### Added
 - support for AssumeRole credential
