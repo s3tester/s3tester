@@ -491,14 +491,14 @@ func TestValidTier(t *testing.T) {
 	_, err = parse(cmdline)
 
 	if err != nil {
-		t.Fatalf("valid restore tier should succeed")
+		t.Fatal("valid restore tier should succeed")
 	}
 
 	cmdline = generateValidCmdlineSetting("-tier=expedited")
 	_, err = parse(cmdline)
 
 	if err != nil {
-		t.Fatalf("valid restore tier should succeed")
+		t.Fatal("valid restore tier should succeed")
 	}
 }
 
@@ -507,7 +507,7 @@ func TestInvalidTier(t *testing.T) {
 	_, err := parse(cmdline)
 
 	if err == nil {
-		t.Fatalf("invalid restore tier should fail")
+		t.Fatal("invalid restore tier should fail")
 	}
 }
 
@@ -516,7 +516,7 @@ func TestValidDays(t *testing.T) {
 	_, err := parse(cmdline)
 
 	if err != nil {
-		t.Fatalf("valid restore tier should succeed")
+		t.Fatal("valid restore tier should succeed")
 	}
 }
 
@@ -525,7 +525,7 @@ func TestInvalidDays(t *testing.T) {
 	_, err := parse(cmdline)
 
 	if err == nil {
-		t.Fatalf("invalid restore tier should fail")
+		t.Fatal("invalid restore tier should fail")
 	}
 }
 
@@ -534,7 +534,7 @@ func TestValidSuffixNaming(t *testing.T) {
 	_, err := parse(cmdline)
 
 	if err != nil {
-		t.Fatalf("valid suffix-naming should succeed")
+		t.Fatal("valid suffix-naming should succeed")
 	}
 }
 
@@ -543,7 +543,7 @@ func TestInvalidSuffixNaming(t *testing.T) {
 	_, err := parse(cmdline)
 
 	if err == nil {
-		t.Fatalf("invalid suffix-naming should fail")
+		t.Fatal("invalid suffix-naming should fail")
 	}
 }
 
@@ -552,7 +552,7 @@ func TestProfileAndNosign(t *testing.T) {
 	_, err := parse(cmdline)
 
 	if err == nil {
-		t.Fatalf("invalid profile and nosign should fail")
+		t.Fatal("invalid profile and nosign should fail")
 	}
 }
 
@@ -562,7 +562,7 @@ func createWorkloadJSON(tb testing.TB, jsonName, jsonString string) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	fmt.Fprintf(file, jsonString)
+	fmt.Fprint(file, jsonString)
 	file.Close()
 }
 

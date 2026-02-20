@@ -343,7 +343,7 @@ func createFile(tb testing.TB, fileName, fileContent string) *os.File {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	fmt.Fprintf(file, fileContent)
+	fmt.Fprint(file, fileContent)
 	return file
 }
 

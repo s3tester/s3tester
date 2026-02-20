@@ -1,5 +1,0 @@
-{"mixedWorkload":[{"operationType":"put","ratio":25},
-											  {"operationType":"get","ratio":25},
-											  {"operationType":"updatemeta","ratio":25},
-											  {"operationType":"delete","ratio":25}]
-											}
