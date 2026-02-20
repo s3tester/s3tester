@@ -195,17 +195,20 @@ func (m *debugErrorResponse) HandleDeserialize(
 ) (
 	out middleware.DeserializeOutput, metadata middleware.Metadata, err error,
 ) {
+	// Call the next handler first to get the response
+	out, metadata, err = next.HandleDeserialize(ctx, in)
+
 	resp, ok := out.RawResponse.(*smithyhttp.Response)
 	if !ok || resp == nil {
-		return next.HandleDeserialize(ctx, in)
+		return out, metadata, err
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var buf bytes.Buffer
 		if resp.Body != nil {
-			_, err := io.Copy(&buf, resp.Body)
-			if err != nil {
-				log.Printf("failed to read error response body: %v", err)
+			_, copyErr := io.Copy(&buf, resp.Body)
+			if copyErr != nil {
+				log.Printf("failed to read error response body: %v", copyErr)
 			}
 			resp.Body.Close()
 		}
@@ -220,7 +223,7 @@ func (m *debugErrorResponse) HandleDeserialize(
 		)
 	}
 
-	return next.HandleDeserialize(ctx, in)
+	return out, metadata, err
 }
 
 func AddDebugErrorResponseMiddleware(enabled bool) func(*middleware.Stack) error {

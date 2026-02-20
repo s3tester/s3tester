@@ -1035,7 +1035,7 @@ func MakeS3Service(ctx context.Context, client *http.Client, config *Config, arg
 	s3Options := []func(*s3.Options){
 		func(o *s3.Options) {
 			o.Retryer = retry.AddWithErrorCodes(o.Retryer, "InvalidPart")
-			o.Retryer = retry.AddWithMaxAttempts(o.Retryer, config.Retries)
+			o.Retryer = retry.AddWithMaxAttempts(o.Retryer, config.Retries+1)
 		},
 	}
 
