@@ -43,6 +43,7 @@ func (m *addCustomHeader) HandleBuild(ctx context.Context, in middleware.BuildIn
 	return next.HandleBuild(ctx, in)
 }
 
+// AddCustomHeader returns a middleware function that adds a custom HTTP header to requests.
 func AddCustomHeader(header, val string) func(*middleware.Stack) error {
 	return func(s *middleware.Stack) error {
 		return s.Build.Add(&addCustomHeader{
@@ -78,6 +79,7 @@ func (m *addHeaders) HandleBuild(ctx context.Context, in middleware.BuildInput, 
 	return next.HandleBuild(ctx, in)
 }
 
+// AddHeaders returns a middleware function that adds multiple HTTP headers to requests.
 func AddHeaders(headers headerFlags) func(*middleware.Stack) error {
 	return func(s *middleware.Stack) error {
 		return s.Build.Add(&addHeaders{
@@ -120,6 +122,7 @@ func (m *addQuery) HandleBuild(ctx context.Context, in middleware.BuildInput, ne
 	return next.HandleBuild(ctx, in)
 }
 
+// AddQuery returns a middleware function that adds query parameters to requests.
 func AddQuery(query string) func(*middleware.Stack) error {
 	return func(s *middleware.Stack) error {
 		return s.Build.Add(&addQuery{
@@ -161,6 +164,7 @@ func (m *printResponseHeaders) HandleDeserialize(
 	return out, metadata, err
 }
 
+// AddPrintResponseHeaders returns a middleware function that prints specified response headers on error responses.
 func AddPrintResponseHeaders(envVar string) func(*middleware.Stack) error {
 	headersEnv := os.Getenv(envVar)
 	if len(headersEnv) == 0 {
@@ -226,6 +230,7 @@ func (m *debugErrorResponse) HandleDeserialize(
 	return out, metadata, err
 }
 
+// AddDebugErrorResponseMiddleware returns a middleware function that logs error response details for debugging.
 func AddDebugErrorResponseMiddleware(enabled bool) func(*middleware.Stack) error {
 	if !enabled {
 		return func(s *middleware.Stack) error { return nil }
