@@ -32,6 +32,12 @@ var (
 	rangeStartExp = regexp.MustCompile(`=(\d+)`)
 )
 
+// PutBody holds a precomputed body data block and its checksum(s).
+type PutBody struct {
+	Data []byte
+	MD5  string
+}
+
 // S3API defines the interface for S3 operations used by the tester.
 type S3API interface {
 	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
@@ -75,29 +81,40 @@ func Options(client *http.Client, endpoint string) error {
 	return nil
 }
 
-// Put performs an S3 PUT to the given bucket and key using the supplied configuration
-func Put(ctx context.Context, svc S3API, bucket, key, tagging string, size int64, metadata map[string]string) error {
-	obj := NewDummyReader(size, key)
+// Put performs an S3 PUT to the given bucket and key using the supplied configuration.
+// If a precomputed body is provided and its size matches, it will be used for better performance.
+// Otherwise, the body and MD5 are generated on-the-fly.
+func Put(ctx context.Context, svc S3API, bucket, key, tagging string, size int64, metadata map[string]string, body *PutBody) error {
+	var reader *DummyReader
+	var contentMD5 string
 
-	contentMD5, err := encodeMD5(obj)
-	if err != nil {
-		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+	// Use precomputed body if available and size matches, otherwise generate on-the-fly
+	if body != nil {
+		reader = NewDummyReaderFromBlock(size, body.Data)
+		contentMD5 = body.MD5
+	} else {
+		reader = NewDummyReader(size, key)
+		var err error
+		contentMD5, err = encodeMD5(reader)
+		if err != nil {
+			return fmt.Errorf("calculating MD5 failed for object bucket: %s, key: %s, err: %v", bucket, key, err)
+		}
 	}
 
 	params := &s3.PutObjectInput{
 		Bucket:        aws.String(bucket),
 		Key:           aws.String(key),
 		ContentLength: &size,
-		ContentMD5:    aws.String(contentMD5),
-		Body:          obj,
+		Body:          reader,
 		Metadata:      metadata,
+		ContentMD5:    aws.String(contentMD5),
 	}
 
 	if tagging != "" {
 		params.Tagging = aws.String(tagging)
 	}
 
-	_, err = svc.PutObject(ctx, params)
+	_, err := svc.PutObject(ctx, params)
 
 	return err
 }
@@ -261,7 +278,7 @@ func MultipartPut(ctx context.Context, svc S3API, bucket, key string, size, part
 
 	contentMD5, err := encodeMD5(obj)
 	if err != nil {
-		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+		return fmt.Errorf("calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
 	}
 	uparams := &s3.UploadPartInput{
 		Bucket:        aws.String(bucket),
@@ -274,7 +291,7 @@ func MultipartPut(ctx context.Context, svc S3API, bucket, key string, size, part
 
 	contentSHA256, err := encodeSHA256(obj)
 	if err != nil {
-		return fmt.Errorf("Calculating SHA-256 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+		return fmt.Errorf("calculating SHA-256 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
 	}
 
 	partdata := make([]types.CompletedPart, 0, numParts)
@@ -299,7 +316,7 @@ func MultipartPut(ctx context.Context, svc S3API, bucket, key string, size, part
 		// If we don't reset the offset the second part read will get an EOF and have
 		// a zero byte body.
 		if _, err = obj.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("Resetting object failed while uploading parts %v/%v %v: %v", bucket, key, uploadID, err)
+			return fmt.Errorf("resetting object failed while uploading parts %v/%v %v: %v", bucket, key, uploadID, err)
 		}
 	}
 
@@ -308,12 +325,12 @@ func MultipartPut(ctx context.Context, svc S3API, bucket, key string, size, part
 	uparams.PartNumber = aws.Int32(int32(numParts))
 
 	if contentMD5, err = encodeMD5(lastobj); err != nil {
-		return fmt.Errorf("Calculating MD5 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+		return fmt.Errorf("calculating MD5 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
 	}
 	uparams.ContentMD5 = aws.String(contentMD5)
 
 	if contentSHA256, err = encodeSHA256(lastobj); err != nil {
-		return fmt.Errorf("Calculating SHA-256 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+		return fmt.Errorf("calculating SHA-256 failed for the last part of multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
 	}
 
 	uoutput, err := svc.UploadPart(ctx, uparams, func(o *s3.Options) {
@@ -473,7 +490,7 @@ func verifyGetData(body io.ReadCloser, input *s3.GetObjectInput, verify int, par
 			offset := (index & (objectDataBlockSize - 1)) % keylen
 
 			if buffer[i] != key[offset] {
-				return errors.New("Retrieved data different from expected")
+				return errors.New("retrieved data different from expected")
 			}
 			index++
 		}
@@ -530,7 +547,8 @@ func DispatchOperation(ctx context.Context, svc S3API, client *http.Client, op, 
 	case "options":
 		err = Options(client, r.Endpoint)
 	case "put":
-		if err = Put(ctx, svc, args.Bucket, keyName, args.Tagging, int64(args.Size), parseMetadataString(args.Metadata)); err == nil {
+		if err = Put(ctx, svc, args.Bucket, keyName, args.Tagging, int64(args.Size), parseMetadataString(args.Metadata),
+			args.putBody); err == nil {
 			r.TotalObjectSize += int64(args.Size)
 		}
 	case "puttagging":

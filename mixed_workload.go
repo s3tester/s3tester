@@ -61,7 +61,7 @@ func SetupOps(args *Parameters, workerChans []*workerChan, decoder *json.Decoder
 	if err != nil {
 		return err
 	} else if workType != "mixedWorkload" {
-		return errors.New("Incorrect workload type specified, must be 'mixedWorkload'")
+		return errors.New("incorrect workload type specified, must be 'mixedWorkload'")
 	}
 
 	workloadParams := setupWorkloadParams(workerChans, args.Concurrency)
