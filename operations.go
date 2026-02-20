@@ -32,6 +32,7 @@ var (
 	rangeStartExp = regexp.MustCompile(`=(\d+)`)
 )
 
+// S3API defines the interface for S3 operations used by the tester.
 type S3API interface {
 	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	CopyObject(context.Context, *s3.CopyObjectInput, ...func(*s3.Options)) (*s3.CopyObjectOutput, error)

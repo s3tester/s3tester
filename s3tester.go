@@ -992,6 +992,7 @@ func MakeHTTPClient() *http.Client {
 	}
 }
 
+// WithContentMD5Option returns a middleware function that configures Content-MD5 checksum for requests.
 func WithContentMD5Option() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		stack.Initialize.Remove("AWSChecksum:SetupInputContext")
