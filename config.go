@@ -56,10 +56,10 @@ type Config struct {
 
 func validateConfig(config *Config) error {
 	if config.Retries < 0 {
-		return errors.New("Retries must be >= 0")
+		return errors.New("retries must be >= 0")
 	}
 	if config.RetrySleep < 0 {
-		return errors.New("RetrySleep must be >= 0")
+		return errors.New("retrySleep must be >= 0")
 	}
 	return nil
 }
@@ -112,6 +112,7 @@ type Parameters struct {
 	randomRangeMin  int64
 	randomRangeMax  int64
 	randomRangeSize int64
+	putBody         *PutBody
 }
 
 // NewParameters returns default parameters
@@ -135,6 +136,24 @@ func (params *Parameters) Copy() *Parameters {
 		dst.Header[k] = v
 	}
 	return &dst
+}
+
+// PreallocatePutBody initializes the precomputed body and MD5 hash based on current
+// Size and Prefix values. This is useful when Size is modified after initial parsing.
+func (params *Parameters) PreallocatePutBody() error {
+	if params.Size > 0 && params.Prefix != "" {
+		data := generateDataFromKey(params.Prefix, objectDataBlockSize)
+		reader := NewDummyReaderFromBlock(int64(params.Size), data)
+		md5Hash, err := encodeMD5(reader)
+		if err != nil {
+			return fmt.Errorf("MD5 calculation failed: %v", err)
+		}
+		params.putBody = &PutBody{
+			Data: data,
+			MD5:  md5Hash,
+		}
+	}
+	return nil
 }
 
 // Merge a collection of fields by json tag name into a parameters instance while ignoring fields
@@ -172,7 +191,7 @@ func (hf *headerFlags) String() string {
 func (hf *headerFlags) Set(v string) error {
 	keyval := strings.SplitN(v, ":", 2)
 	if len(keyval) != 2 {
-		return fmt.Errorf("Failed to parse header: %v", v)
+		return fmt.Errorf("failed to parse header: %v", v)
 	}
 	// Overrides duplicates.
 	(*hf)[keyval[0]] = keyval[1]
@@ -333,11 +352,11 @@ Note: Requests are generated in the same order that you specify operations. That
 			Funcs(template.FuncMap{"makeSlice": makeSlice}).
 			ParseFiles(config.Workload)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse workload template: %v", err)
+			return nil, fmt.Errorf("failed to parse workload template: %v", err)
 		}
 		b := &bytes.Buffer{}
 		if err = t.Execute(b, nil); err != nil {
-			return nil, fmt.Errorf("Failed to execute workload template: %v", err)
+			return nil, fmt.Errorf("failed to execute workload template: %v", err)
 		}
 		ignoreFlags := make([]string, 0) // Flags to ignore when merging the workload since command-line is higher priority
 		flags.Visit(func(f *flag.Flag) {
@@ -385,12 +404,12 @@ func createWorklist(params Parameters, workloadData []byte, ignore []string) ([]
 	}
 	var workload map[string]interface{}
 	if err := json.Unmarshal(workloadData, &workload); err != nil {
-		return nil, fmt.Errorf("Failed parsing workload file: %v", err)
+		return nil, fmt.Errorf("failed parsing workload file: %v", err)
 	}
 	var global map[string]interface{}
 	if g, ok := workload[globalField]; ok {
 		if global, ok = g.(map[string]interface{}); !ok {
-			return nil, fmt.Errorf("Failed parsing workload: %q field does not match schema", globalField)
+			return nil, fmt.Errorf("failed parsing workload: %q field does not match schema", globalField)
 		}
 	}
 	globalParams := params
@@ -402,14 +421,14 @@ func createWorklist(params Parameters, workloadData []byte, ignore []string) ([]
 	var tests []interface{}
 	if t, ok := workload[workloadField]; ok {
 		if tests, ok = t.([]interface{}); !ok {
-			return nil, fmt.Errorf("Failed parsing workload: %q field does not match schema", workloadField)
+			return nil, fmt.Errorf("failed parsing workload: %q field does not match schema", workloadField)
 		}
 	}
 
 	for i, v := range tests {
 		test, ok := v.(map[string]interface{})
 		if !ok {
-			return nil, fmt.Errorf("Failed parsing workload: test at position %d does not match schema", i)
+			return nil, fmt.Errorf("failed parsing workload: test at position %d does not match schema", i)
 		}
 
 		testParams := globalParams.Copy()
@@ -433,33 +452,33 @@ func setupParam(args *Parameters) error {
 	isDurationSet := args.Duration != 0
 	isRequestsSet := args.Requests != 1000
 	if !isDurationSet && args.Requests <= 0 {
-		return errors.New("Number of requests must be > 0")
+		return errors.New("number of requests must be > 0")
 	}
 
 	if isDurationSet && args.Duration < 0 {
-		return errors.New("Duration must be >= 0")
+		return errors.New("duration must be >= 0")
 	}
 
 	if isDurationSet {
 		if args.Operation == "delete" {
-			return fmt.Errorf("Duration not supported for operation %q", args.Operation)
+			return fmt.Errorf("duration not supported for operation %q", args.Operation)
 		}
 
 		if isRequestsSet && args.IsDurationOperation() {
-			return fmt.Errorf("Using duration with requests is not supported for operation %q", args.Operation)
+			return fmt.Errorf("using duration with requests is not supported for operation %q", args.Operation)
 		}
 
 		if !isRequestsSet && !args.IsDurationOperation() {
-			return fmt.Errorf("Using duration without requests is not supported for operation %q", args.Operation)
+			return fmt.Errorf("using duration without requests is not supported for operation %q", args.Operation)
 		}
 
 		if args.MixedWorkload != "" {
-			return errors.New("Duration not supported for mixed-workload")
+			return errors.New("duration not supported for mixed-workload")
 		}
 	}
 
 	if args.Wait < 0 {
-		return errors.New("Wait must be >= 0")
+		return errors.New("wait must be >= 0")
 	}
 
 	args.ratePerSecond = rate.Limit(args.RateLimit)
@@ -469,7 +488,7 @@ func setupParam(args *Parameters) error {
 	}
 
 	if args.Concurrency <= 0 {
-		return errors.New("Concurrency must be > 0")
+		return errors.New("concurrency must be > 0")
 	}
 
 	if !strings.EqualFold(args.SuffixNaming, "separate") && !strings.EqualFold(args.SuffixNaming, "together") {
@@ -497,27 +516,27 @@ func setupParam(args *Parameters) error {
 	}
 
 	if !isDurationSet && args.Requests < args.Concurrency {
-		return errors.New("Number of requests must be greater than or equal to concurrency")
+		return errors.New("number of requests must be greater than or equal to concurrency")
 	}
 
 	if args.Operation == "multipartput" {
 		if args.PartSize < 5*(1<<20) {
-			return errors.New("Part size should be 5MiB at minimum")
+			return errors.New("part size should be 5MiB at minimum")
 		}
 		if int(math.Ceil(float64(args.Size)/float64(args.PartSize))) > 10000 {
-			return errors.New("The multipart upload will use too many parts (max 10000)")
+			return errors.New("the multipart upload will use too many parts (max 10000)")
 		}
 	}
 
 	if args.Repeat < 0 {
-		return errors.New("Repeat must be >= 0")
+		return errors.New("repeat must be >= 0")
 	}
 
 	// attempts indicate the number of times we perform S3 operation, the default attempts is 1
 	args.attempts = 1 + args.Repeat
 
 	if args.NoSignRequest && args.Profile != "" {
-		return errors.New("Cannot load credential profile if argument nosign is provided")
+		return errors.New("cannot load credential profile if argument nosign is provided")
 	}
 
 	if args.UniformDist != "" && (args.Operation != "put" && args.Operation != "get") {
@@ -525,11 +544,11 @@ func setupParam(args *Parameters) error {
 	}
 
 	if !strings.EqualFold(args.Tier, "Standard") && !strings.EqualFold(args.Tier, "Expedited") && !strings.EqualFold(args.Tier, "Bulk") {
-		return errors.New("Restore tier must be one of Standard, Expedited, or Bulk. Case Insensitive")
+		return errors.New("restore tier must be one of Standard, Expedited, or Bulk. Case Insensitive")
 	}
 
 	if args.Days < 1 {
-		return errors.New("Restore days must be a positive, non-zero integer")
+		return errors.New("restore days must be a positive, non-zero integer")
 	}
 
 	var err error
@@ -543,7 +562,7 @@ func setupParam(args *Parameters) error {
 	}
 
 	if (args.Concurrency)%len(args.endpoints) != 0 {
-		return errors.New("The concurrency must be multiple of endpoint list length")
+		return errors.New("the concurrency must be multiple of endpoint list length")
 	}
 
 	args.min, args.max, err = extractRangeMinMax(args.UniformDist)
@@ -577,27 +596,35 @@ func setupParam(args *Parameters) error {
 	}
 
 	if args.Range != "" && args.Operation != "get" {
-		return errors.New("Operation type for range read must be get")
+		return errors.New("operation type for range read must be get")
 	}
 
 	if args.Range != "" {
 		rangeParts := strings.Split(args.Range, "=")
 		if len(rangeParts) != 2 {
-			return errors.New("Range must be in the form bytes=<min>-<max>")
+			return errors.New("range must be in the form bytes=<min>-<max>")
 		}
 
 		if rangeParts[0] != "bytes" {
-			return errors.New("Range must be in the form bytes=<min>-<max>")
+			return errors.New("range must be in the form bytes=<min>-<max>")
 		}
 
 		_, _, err := extractRangeMinMax(rangeParts[1])
 		if err != nil {
-			return fmt.Errorf("Unable to parse range: %v", err)
+			return fmt.Errorf("unable to parse range: %v", err)
 		}
 	}
 
 	if _, err := url.ParseQuery(args.QueryParams); err != nil {
-		return fmt.Errorf("Unable to parse query parameters: %v", err)
+		return fmt.Errorf("unable to parse query parameters: %v", err)
+	}
+
+	// Precompute object body block for PUT operations. This avoids data generation for each PUT.
+	// Keep multipart put as unique objects for each object. The bodies are shared between parts so this already has some optimization.
+	if args.Operation == "put" && args.Size > 0 && args.Prefix != "" {
+		if err := args.PreallocatePutBody(); err != nil {
+			return fmt.Errorf("preallocating put body failed: %v", err)
+		}
 	}
 
 	return nil
@@ -657,15 +684,6 @@ func contains(slice []string, elem string) bool {
 		}
 	}
 	return false
-}
-
-func remove(slice []string, elem string) []string {
-	for i, v := range slice {
-		if v == elem {
-			return append(slice[:i], slice[i+1:]...)
-		}
-	}
-	return slice
 }
 
 func isValidDirective(directive string) bool {

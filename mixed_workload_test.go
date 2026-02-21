@@ -12,10 +12,7 @@ import (
 var s1 = s3op{Event: "put", Size: 10000, Bucket: "not", Key: "testobject-0"}
 var s2 = s3op{Event: "get", Size: 10000, Bucket: "not", Key: "testobject-0"}
 var s3s = s3op{Event: "put", Size: 10000, Bucket: "not", Key: "testobject-1"}
-var s4 = s3op{Event: "put", Size: 10000, Bucket: "not", Key: "testobject-2"}
-var s5 = s3op{Event: "get", Size: 10000, Bucket: "not", Key: "testobject-0"}
 var s6 = s3op{Event: "get", Size: 10000, Bucket: "not", Key: "testobject-1"}
-var s7 = s3op{Event: "get", Size: 10000, Bucket: "not", Key: "testobject-2"}
 
 func argGenerator(tb testing.TB) (args Parameters) {
 	tb.Helper()

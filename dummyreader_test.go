@@ -53,8 +53,8 @@ func TestReadEOF(t *testing.T) {
 	// The length of the buffer indicates how many bytes we want back from calling Read
 	buff := make([]byte, len(data))
 
+	_, _ = d.Read(buff)
 	bytesRead, err := d.Read(buff)
-	bytesRead, err = d.Read(buff)
 
 	if err != io.EOF && bytesRead != 0 {
 		t.Fatalf("expected no error but got %s", err)

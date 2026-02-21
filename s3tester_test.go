@@ -394,8 +394,8 @@ func TestLoadAnonymousCredential(t *testing.T) {
 func TestLoadEnvCredential(t *testing.T) {
 	testAccessKey := "testkey"
 	testSecretKey := testAccessKey + "/" + testAccessKey
-	os.Setenv(accessKey, testAccessKey)
-	os.Setenv(secretKey, testSecretKey)
+	t.Setenv(accessKey, testAccessKey)
+	t.Setenv(secretKey, testSecretKey)
 
 	config := testArgs(t, "put", "www.example.com:18082")
 	args := config.worklist[0]
@@ -421,15 +421,23 @@ func TestLoadDefaultCliCredential(t *testing.T) {
 	config := testArgs(t, "put", "www.example.com:18082")
 	args := config.worklist[0]
 
-	os.Setenv(accessKey, "")
-	os.Setenv(secretKey, "")
+	// Clear all AWS credential environment variables by pointing to non-existent paths
+	// Empty strings may cause SDK to fall back to defaults
+	t.Setenv(accessKey, "")
+	t.Setenv(secretKey, "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+	t.Setenv("AWS_CONFIG_FILE", "/nonexistent/config")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "")
+	t.Setenv("AWS_ROLE_ARN", "")
 	defaultPath := ""
 	system := runtime.GOOS
 	if system == "darwin" || system == "linux" {
-		os.Setenv("HOME", "/user")
+		t.Setenv("HOME", "/user")
 		defaultPath = "/user/.aws/credentials"
 	} else if system == "windows" {
-		os.Setenv("UserProfile", "\\user\\")
+		t.Setenv("UserProfile", "\\user\\")
 		defaultPath = "\\user\\.aws\\credentials"
 	}
 	if _, err := os.Stat(defaultPath); os.IsNotExist(err) {
@@ -1861,6 +1869,9 @@ func TestMixedPutGet(t *testing.T) {
 	h.args.Concurrency = 1
 	h.args.Size = 100
 	h.args.Bucket = "not"
+	if err := h.args.PreallocatePutBody(); err != nil {
+		t.Fatal(err)
+	}
 
 	results := h.runTester(t)
 
@@ -1887,6 +1898,9 @@ func TestMixedPutGetLargeMultiCon(t *testing.T) {
 	h.args.Concurrency = 5
 	h.args.Size = 30
 	h.args.Bucket = "not"
+	if err := h.args.PreallocatePutBody(); err != nil {
+		t.Fatal(err)
+	}
 
 	results := h.runTester(t)
 
@@ -1918,6 +1932,9 @@ func TestMixedPutGetLargeMultiCon2(t *testing.T) {
 	h.args.Concurrency = 5
 	h.args.Size = 30
 	h.args.Bucket = "not"
+	if err := h.args.PreallocatePutBody(); err != nil {
+		t.Fatal(err)
+	}
 
 	results := h.runTester(t)
 
@@ -1951,6 +1968,9 @@ func TestMixedPutGetDeleteSmall(t *testing.T) {
 	h.args.Concurrency = 1
 	h.args.Size = 30
 	h.args.Bucket = "not"
+	if err := h.args.PreallocatePutBody(); err != nil {
+		t.Fatal(err)
+	}
 
 	results := h.runTester(t)
 
@@ -1993,6 +2013,9 @@ func TestMixedPutGetDeleteLarge(t *testing.T) {
 	h.args.Concurrency = 4
 	h.args.Size = 30
 	h.args.Bucket = "not"
+	if err := h.args.PreallocatePutBody(); err != nil {
+		t.Fatal(err)
+	}
 
 	results := h.runTester(t)
 

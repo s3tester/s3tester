@@ -127,7 +127,11 @@ func TestPutOp(t *testing.T) {
 
 	svc := NewMockS3Client(handler)
 
-	Put(context.Background(), svc, "b", "k1", "", numBytes, map[string]string{})
+	precomputed := &PutBody{
+		Data: generateDataFromKey("k1", int(numBytes)),
+		MD5:  md5,
+	}
+	Put(context.Background(), svc, "b", "k1", "", numBytes, map[string]string{}, precomputed)
 }
 
 func TestPutWithTagsOp(t *testing.T) {
@@ -168,7 +172,11 @@ func TestPutWithTagsOp(t *testing.T) {
 
 	svc := NewMockS3Client(handler)
 
-	err := Put(context.Background(), svc, "b", "k1", tags, numBytes, map[string]string{})
+	precomputed := &PutBody{
+		Data: generateDataFromKey("k1", int(numBytes)),
+		MD5:  "",
+	}
+	err := Put(context.Background(), svc, "b", "k1", tags, numBytes, map[string]string{}, precomputed)
 
 	if err != nil {
 		t.Fatalf("Failed PUT operation with error: %v", err)
