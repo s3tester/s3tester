@@ -402,6 +402,9 @@ func parseMetadataString(metaString string) map[string]string {
 func identityGetObject(ctx context.Context, c S3API, input *s3.GetObjectInput, verify int, partsize int64, size int64) (output *s3.GetObjectOutput, err error) {
 	output, err = c.GetObject(ctx, input, func(o *s3.Options) {
 		o.APIOptions = append(o.APIOptions, AddCustomHeader("Accept-Encoding", "identity"))
+		// Disable response checksum validation to avoid warnings when the server
+		// doesn't return checksum headers (common with S3-compatible storage)
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	if err != nil {
 		return nil, err
