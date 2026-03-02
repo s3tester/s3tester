@@ -599,7 +599,6 @@ func processTestResult(testResult *results, args Parameters) {
 	}
 
 	cumulativeResult.Category = args.Bucket + "-" + cumulativeResult.Operation + "-" + strconv.Itoa(cumulativeResult.Concurrency) + "-" + strconv.FormatInt(cumulativeResult.TotalObjectSize, 10)
-	rand.Seed(time.Now().Unix())
 	cumulativeResult.UniqueName = cumulativeResult.Category + "-" + time.Now().UTC().Format(time.RFC3339) + "-" + strconv.Itoa(rand.Intn(100))
 }
 
@@ -886,11 +885,11 @@ func handleTesterResults(config *Config, testResults *Results) (int, error) {
 	})
 
 	if detailLogErr != nil {
-		return failCount, fmt.Errorf("Error writing detailed log to file: %v", detailLogErr)
+		return failCount, fmt.Errorf("error writing detailed log to file: %v", detailLogErr)
 	}
 
 	if latencyLogErr != nil {
-		return failCount, fmt.Errorf("Error writing latency log to file: %v", latencyLogErr)
+		return failCount, fmt.Errorf("error writing latency log to file: %v", latencyLogErr)
 	}
 
 	return failCount, nil

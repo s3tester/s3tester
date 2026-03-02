@@ -30,6 +30,13 @@ func NewDummyReader(size int64, seed string) *DummyReader {
 	return &d
 }
 
+// NewDummyReaderFromBlock constructs a DummyReader using a precomputed block of data
+func NewDummyReaderFromBlock(size int64, block []byte) *DummyReader {
+	d := DummyReader{size: size}
+	d.data = bytes.NewReader(block)
+	return &d
+}
+
 // Size returns the total size of the data that DummyReader represents
 func (r *DummyReader) Size() int64 {
 	return r.size
@@ -40,7 +47,7 @@ func (r *DummyReader) Read(p []byte) (n int, err error) {
 	dataLength := r.data.Size()
 
 	if dataLength == 0 {
-		n, err = 0, errors.New("Data needs to be set before reading")
+		n, err = 0, errors.New("data needs to be set before reading")
 		return
 	}
 
@@ -108,9 +115,9 @@ func (r *DummyReader) Seek(offset int64, whence int) (int64, error) {
 			err := updateDummyDataOffset()
 			return off, err
 		}
-		return r.offset, fmt.Errorf("SeekEnd: Cannot seek past start or end of file. offset: %d, size: %d", off, r.size)
+		return r.offset, fmt.Errorf("SeekEnd: cannot seek past start or end of file. offset: %d, size: %d", off, r.size)
 	}
-	return 0, errors.New("Invalid value of whence")
+	return 0, errors.New("invalid value of whence")
 }
 
 // generateDataFromKey is an efficient way to generate data for objects we write to s3. Ideally

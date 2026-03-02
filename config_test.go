@@ -12,9 +12,7 @@ import (
 
 func generateValidCmdlineSetting(toAdds ...string) []string {
 	defaultCmdlineSetting := []string{}
-	for _, toAdd := range toAdds {
-		defaultCmdlineSetting = append(defaultCmdlineSetting, toAdd)
-	}
+	defaultCmdlineSetting = append(defaultCmdlineSetting, toAdds...)
 	return defaultCmdlineSetting
 }
 
@@ -1266,7 +1264,7 @@ func TestRangeValidation(t *testing.T) {
 
 	cmdline = generateValidCmdlineSetting("-operation=get", "-range=bytes=10.0-15.0")
 	_, err = parse(cmdline)
-	expectedErr := "Unable to parse range: min must be >= 0 and an integer"
+	expectedErr := "unable to parse range: min must be >= 0 and an integer"
 	if err == nil || err.Error() != expectedErr {
 		t.Fatalf("invalid range should fail with error message: %s", expectedErr)
 	}
