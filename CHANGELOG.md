@@ -1,4 +1,12 @@
 # Changelog
+## v3.2.1
+### Added
+- Precompute the body and MD5 for S3 PUTs and share the data block for all workers. This speeds up performance by 4x depending on object size.
+
+### Changed
+- Fixed a bug in S3 GETs when the server doesn't return a checksum
+- Updated dependencies
+
 ## v3.2.0
 ### Changed
 - migrated from aws sdk go v1 to aws sdk go v2
