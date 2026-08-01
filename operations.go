@@ -358,7 +358,7 @@ func MultipartPut(ctx context.Context, svc S3API, bucket, key string, size, part
 }
 
 // Get performs an S3 GET for the S3 object specified by the supplied bucket and key
-func Get(ctx context.Context, svc S3API, bucket, key, byteRange string, size int64, verify int, partSize int64) (int64, error) {
+func Get(ctx context.Context, svc S3API, bucket, key, byteRange string, size int64, verify int, prefix string, partSize int64) (int64, error) {
 	params := &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -368,7 +368,7 @@ func Get(ctx context.Context, svc S3API, bucket, key, byteRange string, size int
 		params.Range = aws.String(byteRange)
 	}
 
-	out, err := identityGetObject(ctx, svc, params, verify, partSize, size)
+	out, err := identityGetObject(ctx, svc, params, verify, prefix, partSize, size)
 	if err != nil {
 		return 0, err
 	}
@@ -416,7 +416,7 @@ func parseMetadataString(metaString string) map[string]string {
 }
 
 // identityGetObject retrieves objects from an Amazon S3 HTTP interface
-func identityGetObject(ctx context.Context, c S3API, input *s3.GetObjectInput, verify int, partsize int64, size int64) (output *s3.GetObjectOutput, err error) {
+func identityGetObject(ctx context.Context, c S3API, input *s3.GetObjectInput, verify int, prefix string, partsize int64, size int64) (output *s3.GetObjectOutput, err error) {
 	output, err = c.GetObject(ctx, input, func(o *s3.Options) {
 		o.APIOptions = append(o.APIOptions, AddCustomHeader("Accept-Encoding", "identity"))
 		// Disable response checksum validation to avoid warnings when the server
@@ -437,13 +437,19 @@ func identityGetObject(ctx context.Context, c S3API, input *s3.GetObjectInput, v
 			err = fmt.Errorf("error while reading body of %s/%s: %w", aws.ToString(input.Bucket), aws.ToString(input.Key), err)
 		}
 	} else {
-		err = verifyGetData(output.Body, input, verify, partsize, size, *output.ContentLength)
+		err = verifyGetData(output.Body, input, verify, prefix, partsize, size, *output.ContentLength)
 	}
 	return output, err
 }
 
-func verifyGetData(body io.ReadCloser, input *s3.GetObjectInput, verify int, partsize int64, size int64, contentLength int64) error {
-	key := []byte(aws.ToString(input.Key))
+func verifyGetData(body io.ReadCloser, input *s3.GetObjectInput, verify int, prefix string, partsize int64, size int64, contentLength int64) error {
+	keyFunc := func(input *s3.GetObjectInput, verify int) []byte {
+		if verify == 1 && len(prefix) != 0 {
+			return []byte(prefix)
+		}
+		return []byte(aws.ToString(input.Key))
+	}
+	key := keyFunc(input, verify)
 	buffer := make([]byte, 1024)
 	index := 0
 	var read int
@@ -485,7 +491,7 @@ func verifyGetData(body io.ReadCloser, input *s3.GetObjectInput, verify int, par
 			// at block boundaries and start at the first character at the beginning of a new block. So for a key "abcd" with a block size
 			// of 3, and a 9 byte object we get "abc|abc|abc" (| are block boundaries) instead of fully repeating keys "abcdabcda" which was the previous behavior.
 			//
-			// This uses a modulo optimization for powers of 2. To ge the modulo some value x if x is a power of two you can use
+			// This uses a modulo optimization for powers of 2. To get the modulo some value x if x is a power of two you can use
 			// val & (x-1). In this case we are taking modulo objectDataBlockSize.
 			//
 			// We can further optimize this call by dealing with larger blocks as opposed to single characters but it's probably not worth it right now
@@ -564,7 +570,7 @@ func DispatchOperation(ctx context.Context, svc S3API, client *http.Client, op, 
 		}
 	case "get":
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(ctx, svc, args.Bucket, keyName, args.Range, int64(args.Size), args.Verify, int64(args.PartSize)); err == nil {
+		if retrievedBytes, err = Get(ctx, svc, args.Bucket, keyName, args.Range, int64(args.Size), args.Verify, args.Prefix, int64(args.PartSize)); err == nil {
 			r.TotalObjectSize += retrievedBytes
 		}
 	case "head":
@@ -581,7 +587,7 @@ func DispatchOperation(ctx context.Context, svc S3API, client *http.Client, op, 
 
 		key := args.Prefix + "-" + strconv.FormatInt(objnum, 10)
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(ctx, svc, args.Bucket, key, args.Range, int64(args.Size), args.Verify, int64(args.PartSize)); err == nil {
+		if retrievedBytes, err = Get(ctx, svc, args.Bucket, key, args.Range, int64(args.Size), args.Verify, args.Prefix, int64(args.PartSize)); err == nil {
 			r.TotalObjectSize += retrievedBytes
 		}
 	case "restore":

@@ -291,7 +291,7 @@ Note: Requests are generated in the same order that you specify operations. That
 	flags.StringVar(&params.TaggingDirective, "tagging-directive", directiveCopy, "Specifies whether the object tag-set is copied from the source object or if it is replaced with the tag-set provided in the object copy request. Value must be one of 'COPY' or 'REPLACE'")
 	flags.StringVar(&params.Tier, "tier", "standard", "The retrieval option for restoring an object. One of expedited, standard, or bulk. AWS default option is standard if not specified")
 	flags.StringVar(&params.UniformDist, "uniformDist", "", "Generates a uniform distribution of object sizes given a min-max size (inclusive). uniformDist overrides -size. Ex.: Use -uniformDist=1000-2000 to generate an object between 1000 and 2000 bytes in size.")
-	flags.IntVar(&params.Verify, "verify", 0, "Verify the retrieved data on a get operation (0=disable verify(default), 1=normal put data, 2=multipart put data). If verify=2, partsize is required and default partsize is set to 5242880.")
+	flags.IntVar(&params.Verify, "verify", 0, "Verify the retrieved data on a get operation (0=disable verify(default), 1=normal put data, 2=multipart put data, 3=legacy put data (v3.2.0 or earlier)). If verify=2, partsize is required and default partsize is set to 5242880.")
 
 	flags.Usage = func() {
 		fmt.Fprintf(os.Stderr, "This tool is for generating high performance S3 load against an S3 server.\n")
