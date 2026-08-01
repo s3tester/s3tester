@@ -3,6 +3,7 @@
 
 ### Changed
 - Fix a bug with uniformDist (this was not fixed in 3.2.2)
+- Fix a bug with verify flag
 
 ## v3.2.2
 
