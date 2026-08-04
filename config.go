@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"math"
 	"net/url"
 	"os"
@@ -267,7 +268,7 @@ func parse(args []string) (*Config, error) {
 	flags.BoolVar(&params.NoSignRequest, "no-sign-request", false, "Do not sign requests. Credentials will not be loaded if this argument is provided.")
 	flags.StringVar(&params.Operation, "operation", "put", "operation type: "+strings.Join(operationTypes, textSeriesSeparator))
 	flags.IntVar(&params.Overwrite, "overwrite", 0, "Turns a PUT/GET/HEAD into an operation on the same s3 key. (1=all writes/reads are to same object, 2=threads clobber each other but each write/read is to unique objects).")
-	flags.Var(&params.PartSize, "partsize", "Size of each part (min 5MiB); only has an effect when a multipart PUT is used. Metric and binary byte size entries are valid (for example, 5MiB = 5242880 and 5MB = 5000000).")
+	flags.Var(&params.PartSize, "partsize", "Size of each part; only has an effect when a multipart PUT is used. Metric and binary byte size entries are valid (for example, 5MiB = 5242880 and 5MB = 5000000).")
 	flags.StringVar(&params.Prefix, "prefix", "testobject", "object name prefix")
 	flags.StringVar(&params.Profile, "profile", "", "Use a specific profile from AWS CLI credential file (https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-profiles.html).")
 	flags.StringVar(&params.QueryParams, "query-params", "", "Specify one or more custom query parameters of the form \"<queryparam-name>=<queryparam-value>\" or \"<queryparam-name>\" separated by ampersands.")
@@ -520,8 +521,11 @@ func setupParam(args *Parameters) error {
 	}
 
 	if args.Operation == "multipartput" {
+		if args.PartSize < 1 {
+			return errors.New("part size must be at least 1 byte")
+		}
 		if args.PartSize < 5*(1<<20) {
-			return errors.New("part size should be 5MiB at minimum")
+			log.Printf("warning: part size %v is less than 5MiB; some S3 services may reject non-final parts smaller than 5MiB", args.PartSize)
 		}
 		if int(math.Ceil(float64(args.Size)/float64(args.PartSize))) > 10000 {
 			return errors.New("the multipart upload will use too many parts (max 10000)")

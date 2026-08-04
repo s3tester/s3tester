@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/time/rate"
@@ -287,14 +290,31 @@ func TestRequestsMustBeGreaterThanZero(t *testing.T) {
 	}
 }
 
-func TestTooSmallMultipartPartSizes(t *testing.T) {
-	partsize := 5 * (1 << 20)
-	partsize = partsize - 100
-	cmdline := generateValidCmdlineSetting("-operation=multipartput", "-partsize="+strconv.Itoa(partsize))
+func TestSmallMultipartPartSizesAllowed(t *testing.T) {
+	partsize := 100
+	cmdline := generateValidCmdlineSetting("-operation=multipartput", "-partsize="+strconv.Itoa(partsize), "-size=1000")
+
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	_, err := parse(cmdline)
+
+	if err != nil {
+		t.Fatalf("part sizes less than 5 MiB should be allowed: %v", err)
+	}
+	if !strings.Contains(buf.String(), "warning: part size") {
+		t.Fatalf("expected warning for part size less than 5 MiB, got: %q", buf.String())
+	}
+}
+
+func TestZeroMultipartPartSizeRejected(t *testing.T) {
+	cmdline := generateValidCmdlineSetting("-operation=multipartput", "-partsize=0", "-size=1000")
 	_, err := parse(cmdline)
 
 	if err == nil {
-		t.Fatalf("part sizes less than 5 MiB should fail")
+		t.Fatalf("part size of 0 should fail")
 	}
 }
 
