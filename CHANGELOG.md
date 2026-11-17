@@ -1,5 +1,5 @@
 # Changelog
-## Unreleased
+## v3.3.0
 
 ### Added
 - `key-assignment=dynamic` hands out keys from a counter shared by all workers on all endpoints, so workers and endpoints finish together even when some objects are much slower to access

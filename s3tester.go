@@ -36,7 +36,7 @@ import (
 
 const (
 	// VERSION is displayed with help, bump when updating
-	VERSION = "3.2.3"
+	VERSION = "3.3.0"
 	// for identifying s3tester requests in the user-agent header
 	userAgentString = "s3tester/"
 
