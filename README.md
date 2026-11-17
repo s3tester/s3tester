@@ -46,6 +46,9 @@ $ export AWS_SECRET_ACCESS_KEY=VInXxOfGtEIwVck4AdtUDavmJf/qt3jaJEAvSKZO
 | header | - | Specify one or more headers of the form `<header-name>: <header-value>`. |
 | incrementing | boolean | Force the key naming to be lexicographically increasing. This is achieved by zero-padding the numerical suffix. For most use cases, suffix-naming should be set to `together` if this parameter is set to true. |
 | json | boolean | The result will be printed out in JSON format if this flag exists. Default: `false` |
+| key-assignment | string | How keys are assigned to workers. One of: `static`, `dynamic`. With `static`, each worker is given a fixed set of keys up front (see `suffix-naming`), so workers and endpoints that hit slow objects finish later than the others. With `dynamic`, all workers on all endpoints claim the next unused key from a shared counter as they become free, so they all finish at about the same time; slower endpoints serve fewer requests. `dynamic` cannot be used with `overwrite` or `mixed-workload`, and ignores `suffix-naming`. Default: `static` |
+| key-order | string | Order in which keys are handed out with `key-assignment=dynamic`. One of: `sequential`, `random`. `random` visits every key exactly once in a shuffled order and uses no per-key memory. `random` requires `key-assignment=dynamic` and a request count. Default: `sequential` |
+| key-seed | int | Seed for `key-order=random`. `0` picks a seed from the current time; the seed used is shown in the test parameters. Default: `0` |
 | logdetail | string | Write detailed log to file |
 | loglatency | string | Write latency histogram to file | 
 | metadata  | string | The metadata to use for the objects. The string must be formatted as such: `'key1=value1&key2=value2'`. Used for `put`, `updatemeta`, `multipartput`, `putget` and `putget9010r` |

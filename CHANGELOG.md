@@ -1,4 +1,11 @@
 # Changelog
+## Unreleased
+
+### Added
+- `key-assignment=dynamic` hands out keys from a counter shared by all workers on all endpoints, so workers and endpoints finish together even when some objects are much slower to access
+- `key-order=random` and `key-seed` visit every key exactly once in a shuffled order without per-key memory, with `key-assignment=dynamic`
+- First and last worker finish times in the results
+
 ## v3.2.3
 
 ### Changed
