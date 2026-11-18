@@ -120,18 +120,16 @@ type Result struct {
 	Bucket         string `json:"bucket,omitempty"`
 	Operation      string `json:"operation,omitempty"`
 	Concurrency    int    `json:"concurrency,omitempty"`
+	KeySeed        int64  `json:"keySeed,omitempty"`
 	UniqObjNum     int    `json:"totalUniqueObjects"`
 	Count          int    `json:"totalRequests"`
 	Failcount      int    `json:"failedRequests"`
 	CancelledCount int    `json:"cancelledRequests"`
 
-	TotalElapsedTime float64 `json:"totalElapsedTime (ms)"`
-	// Times from the start of the test until the first and last workers ran out of work
-	FirstWorkerFinishTime float64 `json:"firstWorkerFinishTime (ms)"`
-	LastWorkerFinishTime  float64 `json:"lastWorkerFinishTime (ms)"`
-	AverageRequestTime    float64 `json:"averageRequestTime (ms)"`
-	MinimumRequestTime    float64 `json:"minimumRequestTime (ms)"`
-	MaximumRequestTime    float64 `json:"maximumRequestTime (ms)"`
+	TotalElapsedTime   float64 `json:"totalElapsedTime (ms)"`
+	AverageRequestTime float64 `json:"averageRequestTime (ms)"`
+	MinimumRequestTime float64 `json:"minimumRequestTime (ms)"`
+	MaximumRequestTime float64 `json:"maximumRequestTime (ms)"`
 
 	NominalRequestsPerSec float64            `json:"nominalRequestsPerSec"`
 	ActualRequestsPerSec  float64            `json:"actualRequestsPerSec"`
@@ -146,11 +144,12 @@ type Result struct {
 	startTime   time.Time
 	elapsedTime time.Duration
 	detailed    []detail
+	// When the first and last workers ran out of work; mergeResult keeps the earliest and latest.
 	firstFinish time.Time
 	lastFinish  time.Time
 }
 
-func (r *Result) setFinishTime(t time.Time) {
+func (r *Result) markFinished(t time.Time) {
 	r.firstFinish = t
 	r.lastFinish = t
 }
@@ -496,7 +495,7 @@ func worker(ctx context.Context, results chan<- Result, config *Config, args Par
 				sendRequest(ctx, svc, httpClient, args.Operation, keyName, &args, &r, work.limiter, sysInterruptHandler, config.Debug)
 
 				if durationLimit.enabled() {
-					r.setFinishTime(time.Now())
+					r.markFinished(time.Now())
 					results <- r
 					return
 				}
@@ -505,8 +504,8 @@ func worker(ctx context.Context, results chan<- Result, config *Config, args Par
 
 	}
 
+	r.markFinished(time.Now())
 	resultWG.Done()
-	r.setFinishTime(time.Now())
 	results <- r
 }
 
@@ -637,6 +636,9 @@ func processTestResult(testResult *results, args Parameters) {
 	cumulativeResult := &testResult.CumulativeResult
 	cumulativeResult.Operation = args.Operation
 	cumulativeResult.Concurrency = args.Concurrency
+	if args.KeyOrder == keyOrderRandom {
+		cumulativeResult.KeySeed = args.KeySeed
+	}
 	setupResultStat(cumulativeResult)
 
 	for _, endpointResult := range testResult.PerEndpointResult {
@@ -656,10 +658,6 @@ func setupResultStat(testResult *Result) {
 	minReqTime := time.Duration(testResult.latencies.Min() * 1e4)
 	maxReqTime := time.Duration(testResult.latencies.Max() * 1e4)
 	testResult.TotalElapsedTime = float64(elapsedTime) / float64(time.Millisecond)
-	if !testResult.firstFinish.IsZero() {
-		testResult.FirstWorkerFinishTime = float64(testResult.firstFinish.Sub(testResult.startTime)) / float64(time.Millisecond)
-		testResult.LastWorkerFinishTime = float64(testResult.lastFinish.Sub(testResult.startTime)) / float64(time.Millisecond)
-	}
 	testResult.MinimumRequestTime = float64(minReqTime) / float64(time.Millisecond)
 	testResult.MaximumRequestTime = float64(maxReqTime) / float64(time.Millisecond)
 }
@@ -963,6 +961,9 @@ func printReadableResults(testResults []*results) {
 func printResult(results Result) {
 	fmt.Printf("Endpoint: %s\n", results.Endpoint)
 	fmt.Printf("Concurrency: %d\n", results.Concurrency)
+	if results.KeySeed != 0 {
+		fmt.Printf("Key seed: %d\n", results.KeySeed)
+	}
 	fmt.Printf("Total number of requests: %d\n", results.Count)
 
 	if results.UniqObjNum != 0 {
@@ -972,8 +973,6 @@ func printResult(results Result) {
 	fmt.Printf("Failed requests: %d\n", results.Failcount)
 
 	fmt.Printf("Total elapsed time: %s\n", time.Duration(results.TotalElapsedTime*float64(time.Millisecond)))
-	fmt.Printf("First worker finished: %s\n", time.Duration(results.FirstWorkerFinishTime*float64(time.Millisecond)))
-	fmt.Printf("Last worker finished: %s\n", time.Duration(results.LastWorkerFinishTime*float64(time.Millisecond)))
 	fmt.Printf("Average request time: %s\n", time.Duration(results.AverageRequestTime*float64(time.Millisecond)))
 	fmt.Printf("Minimum request time: %s\n", time.Duration(results.MinimumRequestTime*float64(time.Millisecond)))
 	fmt.Printf("Maximum request time: %s\n", time.Duration(results.MaximumRequestTime*float64(time.Millisecond)))

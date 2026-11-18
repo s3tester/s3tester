@@ -14,6 +14,11 @@ const (
 	keyOrderRandom     = "random"
 )
 
+var (
+	keyAssignments = []string{keyAssignmentStatic, keyAssignmentDynamic}
+	keyOrders      = []string{keyOrderSequential, keyOrderRandom}
+)
+
 // keyCursor hands out key indexes to workers as they become free. A single cursor is shared by
 // every worker on every endpoint of a test, so workers that hit slow objects claim fewer keys and
 // all workers run out of keys at the same time.
@@ -38,8 +43,7 @@ func newKeyCursor(args *Parameters) *keyCursor {
 	c.total = uint64(args.Requests)
 	c.wrap = args.Duration > 0
 	if args.KeyOrder == keyOrderRandom {
-		p := newKeyPermutation(c.total, uint64(args.KeySeed))
-		c.perm = &p
+		c.perm = newKeyPermutation(c.total, uint64(args.KeySeed))
 	}
 	return c
 }
@@ -79,7 +83,7 @@ type keyPermutation struct {
 	keys     [4]uint64
 }
 
-func newKeyPermutation(n, seed uint64) keyPermutation {
+func newKeyPermutation(n, seed uint64) *keyPermutation {
 	bits := uint(1)
 	for (uint64(1) << bits) < n {
 		bits++
@@ -92,7 +96,7 @@ func newKeyPermutation(n, seed uint64) keyPermutation {
 		seed = mix64(seed + uint64(i) + 1)
 		p.keys[i] = seed
 	}
-	return p
+	return &p
 }
 
 // mix64 is the SplitMix64 finalizer.

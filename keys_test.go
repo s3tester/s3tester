@@ -88,8 +88,10 @@ type keyRecorder struct {
 	paths  []string
 }
 
-func newKeyRecorder(delay time.Duration) *keyRecorder {
+func newKeyRecorder(t *testing.T, delay time.Duration) *keyRecorder {
+	t.Helper()
 	k := &keyRecorder{}
+	t.Cleanup(func() { k.server.Close() })
 	k.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		k.mu.Lock()
 		k.paths = append(k.paths, r.URL.Path)
@@ -149,31 +151,36 @@ func requireEveryKeyOnce(t *testing.T, recorders []*keyRecorder, n int) {
 }
 
 func TestDynamicRequestsEveryKeyOnceAcrossEndpoints(t *testing.T) {
-	for _, order := range []string{keyOrderSequential, keyOrderRandom} {
-		t.Run(order, func(t *testing.T) {
-			recorders := []*keyRecorder{newKeyRecorder(0), newKeyRecorder(0)}
-			for _, rec := range recorders {
-				defer rec.server.Close()
-			}
+	tests := []struct {
+		order string
+		seed  int64
+	}{
+		{keyOrderSequential, 0},
+		{keyOrderRandom, 7},
+	}
+	for _, tc := range tests {
+		t.Run(tc.order, func(t *testing.T) {
+			recorders := []*keyRecorder{newKeyRecorder(t, 0), newKeyRecorder(t, 0)}
 			// 101 requests does not divide evenly by concurrency; every key must still be used.
 			res := runDynamicTest(t, recorders, func(args *Parameters) {
 				args.Requests = 101
 				args.Concurrency = 4
-				args.KeyOrder = order
-				args.KeySeed = 7
+				args.KeyOrder = tc.order
+				args.KeySeed = tc.seed
 			})
 			requireEveryKeyOnce(t, recorders, 101)
 			if res.CumulativeResult.Count != 101 || res.CumulativeResult.UniqObjNum != 101 {
 				t.Fatalf("got %d requests and %d unique objects, want 101 of each", res.CumulativeResult.Count, res.CumulativeResult.UniqObjNum)
+			}
+			if res.CumulativeResult.KeySeed != tc.seed {
+				t.Fatalf("result key seed = %d, want %d", res.CumulativeResult.KeySeed, tc.seed)
 			}
 		})
 	}
 }
 
 func TestDynamicShiftsWorkAwayFromSlowEndpoint(t *testing.T) {
-	slow, fast := newKeyRecorder(20*time.Millisecond), newKeyRecorder(0)
-	defer slow.server.Close()
-	defer fast.server.Close()
+	slow, fast := newKeyRecorder(t, 20*time.Millisecond), newKeyRecorder(t, 0)
 	recorders := []*keyRecorder{slow, fast}
 
 	res := runDynamicTest(t, recorders, func(args *Parameters) {
@@ -185,18 +192,17 @@ func TestDynamicShiftsWorkAwayFromSlowEndpoint(t *testing.T) {
 		t.Fatalf("slow endpoint served %d requests and fast endpoint served %d; want the fast endpoint to serve more", s, f)
 	}
 	cr := res.CumulativeResult
-	if cr.FirstWorkerFinishTime <= 0 || cr.LastWorkerFinishTime < cr.FirstWorkerFinishTime {
-		t.Fatalf("invalid worker finish times: first=%v last=%v", cr.FirstWorkerFinishTime, cr.LastWorkerFinishTime)
+	if !cr.firstFinish.After(cr.startTime) || cr.lastFinish.Before(cr.firstFinish) {
+		t.Fatalf("invalid worker finish times: start=%v first=%v last=%v", cr.startTime, cr.firstFinish, cr.lastFinish)
 	}
 	// The workers finish within about one slow request of each other.
-	if spread := cr.LastWorkerFinishTime - cr.FirstWorkerFinishTime; spread > 200 {
-		t.Fatalf("workers finished %vms apart", spread)
+	if spread := cr.lastFinish.Sub(cr.firstFinish); spread > 200*time.Millisecond {
+		t.Fatalf("workers finished %v apart", spread)
 	}
 }
 
 func TestDynamicWrapsForDuration(t *testing.T) {
-	rec := newKeyRecorder(0)
-	defer rec.server.Close()
+	rec := newKeyRecorder(t, 0)
 
 	res := runDynamicTest(t, []*keyRecorder{rec}, func(args *Parameters) {
 		args.Requests = 10
@@ -224,6 +230,13 @@ func TestKeyAssignmentValidation(t *testing.T) {
 		{[]string{"-key-assignment=bogus"}, false},
 		{[]string{"-key-order=bogus", "-key-assignment=dynamic"}, false},
 		{[]string{"-key-order=random"}, false},
+		{[]string{"-key-order=sequential"}, false},
+		{[]string{"-key-assignment=static", "-key-order=sequential"}, false},
+		{[]string{"-key-seed=5"}, false},
+		{[]string{"-key-assignment=dynamic", "-key-seed=5"}, false},
+		{[]string{"-key-assignment=dynamic", "-key-order=sequential", "-key-seed=5"}, false},
+		{[]string{"-key-assignment=dynamic", "-key-order=random", "-key-seed=5"}, true},
+		{[]string{"-key-assignment=dynamic", "-key-order=sequential"}, true},
 		{[]string{"-key-assignment=dynamic", "-overwrite=1"}, false},
 		{[]string{"-key-assignment=dynamic", "-key-order=random", "-operation=put", "-duration=5"}, false},
 		{[]string{"-key-assignment=dynamic", "-operation=put", "-duration=5"}, true},
@@ -241,8 +254,8 @@ func TestKeyOrderRandomPicksSeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.worklist[0].KeySeed == 0 {
-		t.Fatal("expected a seed to be chosen")
+	if seed := config.worklist[0].KeySeed; seed <= 0 || seed >= 1<<53 {
+		t.Fatalf("chosen seed %d is outside (0, 2^53)", seed)
 	}
 	config, err = parse(generateValidCmdlineSetting("-key-assignment=dynamic", "-key-order=random", "-key-seed=99"))
 	if err != nil {
@@ -250,5 +263,28 @@ func TestKeyOrderRandomPicksSeed(t *testing.T) {
 	}
 	if config.worklist[0].KeySeed != 99 {
 		t.Fatalf("got seed %d, want 99", config.worklist[0].KeySeed)
+	}
+}
+
+func TestWorkloadKeySeedIsExact(t *testing.T) {
+	config, err := parse(generateValidCmdlineSetting())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2^53+1 is the smallest integer a float64 cannot represent.
+	const seed = 9007199254740993
+	data := `{"workload": [{"key-assignment": "dynamic", "key-order": "random", "key-seed": 9007199254740993}]}`
+	w, err := createWorklist(config.worklist[0], []byte(data), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w[0].KeySeed != seed {
+		t.Fatalf("got seed %d, want %d", w[0].KeySeed, int64(seed))
+	}
+}
+
+func TestWorkloadRejectsTrailingData(t *testing.T) {
+	if _, err := createWorklist(Parameters{}, []byte(`{} {}`), nil); err == nil {
+		t.Fatal("expected an error for data after the top-level object")
 	}
 }

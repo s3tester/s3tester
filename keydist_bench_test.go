@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Benchmarks for the GET request path and for key distribution strategies.
@@ -67,14 +68,14 @@ func BenchmarkGetEndToEnd(b *testing.B) {
 		b.Fatalf("concurrency %d must be a multiple of endpoints %d", concurrency, numEndpoints)
 	}
 
-	assignments := []struct{ assignment, order string }{
-		{keyAssignmentStatic, keyOrderSequential},
-		{keyAssignmentDynamic, keyOrderSequential},
-		{keyAssignmentDynamic, keyOrderRandom},
+	assignments := []struct{ name, assignment, order string }{
+		{"static", keyAssignmentStatic, ""},
+		{"dynamic-sequential", keyAssignmentDynamic, keyOrderSequential},
+		{"dynamic-random", keyAssignmentDynamic, keyOrderRandom},
 	}
 	for _, size := range []int{1, 1024} {
 		for _, a := range assignments {
-			b.Run(fmt.Sprintf("size=%dB/endpoints=%d/concurrency=%d/keys=%s-%s", size, numEndpoints, concurrency, a.assignment, a.order), func(b *testing.B) {
+			b.Run(fmt.Sprintf("size=%dB/endpoints=%d/concurrency=%d/keys=%s", size, numEndpoints, concurrency, a.name), func(b *testing.B) {
 				benchGetEndToEnd(b, size, numEndpoints, concurrency, requests, a.assignment, a.order)
 			})
 		}
@@ -99,7 +100,9 @@ func benchGetEndToEnd(b *testing.B, size, numEndpoints, concurrency, requests in
 	args.Size = byteSize(size)
 	args.KeyAssignment = assignment
 	args.KeyOrder = order
-	args.KeySeed = 1
+	if order == keyOrderRandom {
+		args.KeySeed = 1
+	}
 
 	var totalRequests int
 	var totalSeconds, p50, p99, maxMs, finishSpreadMs float64
@@ -118,7 +121,7 @@ func benchGetEndToEnd(b *testing.B, size, numEndpoints, concurrency, requests in
 		p50 += cr.Percentiles["50"]
 		p99 += cr.Percentiles["99"]
 		maxMs += cr.MaximumRequestTime
-		finishSpreadMs += cr.LastWorkerFinishTime - cr.FirstWorkerFinishTime
+		finishSpreadMs += float64(cr.lastFinish.Sub(cr.firstFinish)) / float64(time.Millisecond)
 	}
 	b.StopTimer()
 
@@ -195,7 +198,7 @@ func BenchmarkKeySource(b *testing.B) {
 
 		b.Run("dynamic-random"+suffix, func(b *testing.B) {
 			perm := newKeyPermutation(10_000_000_000, 0x5eed)
-			keys := &keyCursor{total: 10_000_000_000, wrap: true, perm: &perm}
+			keys := &keyCursor{total: 10_000_000_000, wrap: true, perm: perm}
 			runKeyBench(b, func(uint64) func() string {
 				return func() string {
 					i, _ := keys.claim()
