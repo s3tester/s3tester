@@ -1,4 +1,15 @@
 # Changelog
+## v3.3.0
+
+### Added
+- `key-assignment=dynamic` hands out keys from a counter shared by all workers on all endpoints, so workers and endpoints finish together even when some objects are much slower to access
+- `key-order=random` and `key-seed` visit every key exactly once in a shuffled order without per-key memory, with `key-assignment=dynamic`
+- The seed used by `key-order=random` is shown in the results (`Key seed` in text output, `keySeed` in JSON)
+
+### Changed
+- Fixed a `get` (or other request-count operation) with `duration` hanging at full CPU, without sending requests or ever finishing, when `requests` is less than `concurrency`; workers with no keys now stop immediately
+- Large integers in workload files are no longer rounded when parsed
+
 ## v3.2.3
 
 ### Changed

@@ -32,6 +32,20 @@
                     "type": "object",
                     "description": "HTTP header: value pairs"
                 },
+                "key-assignment": {
+                    "type": "string",
+                    "enum": ["static", "dynamic"],
+                    "description": "How keys are assigned to workers: a fixed set per worker (static) or claimed from a shared counter as workers become free (dynamic)"
+                },
+                "key-order": {
+                    "type": "string",
+                    "enum": ["sequential", "random"],
+                    "description": "Order in which keys are handed out with key-assignment dynamic"
+                },
+                "key-seed": {
+                    "type": "number",
+                    "description": "Seed for key-order=random; 0 picks a seed from the current time"
+                },
                 "metadata": {
                     "type": "string"
                 },

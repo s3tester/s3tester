@@ -6,7 +6,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
+	"math/rand"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -77,6 +79,9 @@ type Parameters struct {
 	Endpoint          string      `json:"endpoint,omitempty"`
 	Header            headerFlags `json:"header,omitempty"`
 	Incrementing      bool        `json:"incrementing,omitempty"`
+	KeyAssignment     string      `json:"key-assignment,omitempty"`
+	KeyOrder          string      `json:"key-order,omitempty"`
+	KeySeed           int64       `json:"key-seed,omitempty"`
 	Metadata          string      `json:"metadata,omitempty"`
 	MetadataDirective string      `json:"metadata-directive,omitempty"`
 	NoSignRequest     bool        `json:"no-sign-request,omitempty"`
@@ -262,6 +267,9 @@ func parse(args []string) (*Config, error) {
 	flags.StringVar(&params.Endpoint, "endpoint", "https://127.0.0.1:18082", "target endpoint(s). If multiple endpoints are specified separate them with a ','. Note: the concurrency must be a multiple of the number of endpoints.")
 	flags.Var(&params.Header, "header", "Specify one or more headers of the form \"<header-name>: <header-value>\".")
 	flags.BoolVar(&params.Incrementing, "incrementing", false, "Force the key naming to be lexicographically increasing. This is achieved by zero-padding the numerical suffix. For most use cases, suffix-naming should be set to \"together\" if this parameter is set to true.")
+	flags.StringVar(&params.KeyAssignment, "key-assignment", keyAssignmentStatic, "How keys are assigned to workers. One of: static, dynamic. With static, each worker is given a fixed set of keys up front (see suffix-naming), so workers and endpoints that hit slow objects finish later than the others. With dynamic, all workers on all endpoints claim the next unused key from a shared counter as they become free, so they all finish at about the same time; slower endpoints serve fewer requests. dynamic cannot be used with overwrite or mixed-workload, and ignores suffix-naming.")
+	flags.StringVar(&params.KeyOrder, "key-order", "", "Order in which keys are handed out with key-assignment=dynamic. One of: sequential, random. random visits every key exactly once in a shuffled order and uses no per-key memory. Requires key-assignment=dynamic; random also requires a request count. (Default is sequential.)")
+	flags.Int64Var(&params.KeySeed, "key-seed", 0, "Seed for key-order=random, which it requires. 0 picks a random seed; the seed used is shown in the results.")
 	flags.StringVar(&params.Metadata, "metadata", "", "The metadata to use for the objects. The string must be formatted as such: 'key1=value1&key2=value2'. Used for put, updatemeta, multipartput, putget and putget9010r.")
 	flags.StringVar(&params.MetadataDirective, "metadata-directive", directiveCopy, "Specifies whether the metadata is copied from the source object or if it is replaced with the metadata provided in the object copy request. Value must be one of 'COPY' or 'REPLACE'")
 	flags.BoolVar(&params.NoSignRequest, "no-sign-request", false, "Do not sign requests. Credentials will not be loaded if this argument is provided.")
@@ -402,9 +410,15 @@ func createWorklist(params Parameters, workloadData []byte, ignore []string) ([]
 	if workloadData == nil {
 		return worklist, nil
 	}
+	// UseNumber keeps integers above 2^53 exact when Merge re-encodes the fields.
 	var workload map[string]interface{}
-	if err := json.Unmarshal(workloadData, &workload); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(workloadData))
+	dec.UseNumber()
+	if err := dec.Decode(&workload); err != nil {
 		return nil, fmt.Errorf("failed parsing workload file: %v", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("failed parsing workload file: unexpected data after top-level value")
 	}
 	var global map[string]interface{}
 	if g, ok := workload[globalField]; ok {
@@ -497,6 +511,10 @@ func setupParam(args *Parameters) error {
 		} else {
 			return errors.New("suffix-naming must be one of: separate, together")
 		}
+	}
+
+	if err := setupKeyAssignment(args); err != nil {
+		return err
 	}
 
 	if args.Operation == "copy" {
@@ -631,6 +649,56 @@ func setupParam(args *Parameters) error {
 		}
 	}
 
+	return nil
+}
+
+func setupKeyAssignment(args *Parameters) error {
+	args.KeyAssignment = strings.ToLower(args.KeyAssignment)
+	if args.KeyAssignment == "" {
+		args.KeyAssignment = keyAssignmentStatic
+	}
+	if !contains(keyAssignments, args.KeyAssignment) {
+		return fmt.Errorf("key-assignment must be one of: %s", strings.Join(keyAssignments, textSeriesSeparator))
+	}
+
+	args.KeyOrder = strings.ToLower(args.KeyOrder)
+	if args.KeyOrder != "" && !contains(keyOrders, args.KeyOrder) {
+		return fmt.Errorf("key-order must be one of: %s", strings.Join(keyOrders, textSeriesSeparator))
+	}
+
+	if args.KeyAssignment == keyAssignmentStatic {
+		if args.KeyOrder != "" {
+			return errors.New("key-order requires key-assignment=dynamic")
+		}
+		if args.KeySeed != 0 {
+			return errors.New("key-seed requires key-assignment=dynamic and key-order=random")
+		}
+		return nil
+	}
+
+	if args.Overwrite != 0 {
+		return errors.New("key-assignment=dynamic cannot be used with overwrite")
+	}
+	if args.MixedWorkload != "" {
+		return errors.New("key-assignment=dynamic cannot be used with mixed-workload")
+	}
+
+	if args.KeyOrder == "" {
+		args.KeyOrder = keyOrderSequential
+	}
+	if args.KeyOrder == keyOrderSequential && args.KeySeed != 0 {
+		return errors.New("key-seed requires key-order=random")
+	}
+
+	if args.KeyOrder == keyOrderRandom {
+		if args.IsDurationOperation() {
+			return fmt.Errorf("key-order=random requires a request count, which operation %q does not use with duration", args.Operation)
+		}
+		if args.KeySeed == 0 {
+			// Seeds stay below 2^53 so tools that read JSON numbers as doubles keep them exact.
+			args.KeySeed = rand.Int63n(1<<53-1) + 1
+		}
+	}
 	return nil
 }
 

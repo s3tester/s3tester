@@ -36,7 +36,7 @@ import (
 
 const (
 	// VERSION is displayed with help, bump when updating
-	VERSION = "3.2.3"
+	VERSION = "3.3.0"
 	// for identifying s3tester requests in the user-agent header
 	userAgentString = "s3tester/"
 
@@ -120,6 +120,7 @@ type Result struct {
 	Bucket         string `json:"bucket,omitempty"`
 	Operation      string `json:"operation,omitempty"`
 	Concurrency    int    `json:"concurrency,omitempty"`
+	KeySeed        int64  `json:"keySeed,omitempty"`
 	UniqObjNum     int    `json:"totalUniqueObjects"`
 	Count          int    `json:"totalRequests"`
 	Failcount      int    `json:"failedRequests"`
@@ -143,6 +144,14 @@ type Result struct {
 	startTime   time.Time
 	elapsedTime time.Duration
 	detailed    []detail
+	// When the first and last workers ran out of work; mergeResult keeps the earliest and latest.
+	firstFinish time.Time
+	lastFinish  time.Time
+}
+
+func (r *Result) markFinished(t time.Time) {
+	r.firstFinish = t
+	r.lastFinish = t
 }
 
 // NewResult constructs an instance of Result used to store performance metrics
@@ -216,6 +225,7 @@ type work struct {
 	limiter              *rate.Limiter
 	workerChan           *workerChan
 	durationRequestCount *uint64
+	keys                 *keyCursor
 }
 
 func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args Parameters, sysInterruptHandler SyscallHandler) {
@@ -245,6 +255,11 @@ func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args 
 		}()
 	}
 
+	var keys *keyCursor
+	if mixedWorkloadDecoder == nil {
+		keys = newKeyCursor(&args)
+	}
+
 	for i, endpoint := range args.endpoints {
 		endpointStartTime := time.Now()
 
@@ -272,6 +287,7 @@ func startTestWorker(ctx context.Context, c chan<- Result, config *Config, args 
 				limiter:              limiter,
 				workerChan:           workChan,
 				durationRequestCount: durationRequestCount,
+				keys:                 keys,
 			}
 
 			go worker(ctx, c, config, args, &work, sysInterruptHandler)
@@ -413,61 +429,82 @@ func worker(ctx context.Context, results chan<- Result, config *Config, args Par
 		ReceiveS3Op(ctx, svc, httpClient, &args, durationLimit, work.limiter, work.workerChan, &r, sysInterruptHandler, config.Debug)
 	} else {
 		maxRequestsPerWorker := uint64(args.Requests / args.Concurrency)
-		if args.IsDurationOperation() {
+		isDuration := args.IsDurationOperation()
+		if isDuration {
 			maxRequestsPerWorker = math.MaxUint64
 		}
 		formatString := generateFormatString(args.Overwrite, maxRequestsPerWorker, uint64(args.Requests))
 
+		var nextKey func() (string, bool)
+		if work.keys != nil {
+			nextKey = func() (string, bool) {
+				index, ok := work.keys.claim()
+				if !ok {
+					return "", false
+				}
+				return formatKeyName(args.Prefix, index, args.Incrementing, formatString), true
+			}
+		} else {
+			var j uint64
+			nextKey = func() (string, bool) {
+				if j == maxRequestsPerWorker {
+					// Keep sending requests until duration limit is reached.
+					if !durationLimit.applicable || maxRequestsPerWorker == 0 {
+						return "", false
+					}
+					j = 0
+				}
+				keyName := generateKeyName(args.Prefix, j, maxRequestsPerWorker, args.Concurrency, work.id, args.Overwrite, formatString, args.Incrementing, args.SuffixNaming == "separate", isDuration, work.durationRequestCount)
+				j++
+				return keyName, true
+			}
+		}
+
 	OUTER:
-		for {
-			for j := uint64(0); j < maxRequestsPerWorker; j++ {
-				if ctx.Err() != nil {
-					break OUTER
-				}
-				keyName := generateKeyName(args.Prefix, j, maxRequestsPerWorker, args.Concurrency, work.id, args.Overwrite, formatString, args.Incrementing, args.SuffixNaming == "separate", args.IsDurationOperation(), work.durationRequestCount)
-
-				if args.Operation != "options" {
-					r.UniqObjNum++
-				}
-
-				for repcount := 0; repcount < args.attempts; repcount++ {
-					// Stop sending requests if the context has hit a deadline/timeout or been cancelled
-					if ctx.Err() != nil {
-						r.CancelledCount++
-						break OUTER
-					}
-					if source != nil {
-						if args.hasRandomSize() {
-							//size command line arg usually sets the size for each request we need to overwrite
-							// with new random size per request
-							newSize := randMinMax(source, args.min, args.max)
-							args.Size = byteSize(newSize)
-						} else if args.hasRandomRange() {
-							// range is inclusive
-							maxRangeStartIndex := args.randomRangeMax - args.randomRangeSize + 1
-							rangeStart := randMinMax(source, args.randomRangeMin, maxRangeStartIndex)
-							rangeEnd := rangeStart + args.randomRangeSize - 1
-							args.Range = fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
-							args.Size = byteSize(args.randomRangeSize)
-						}
-					}
-					sendRequest(ctx, svc, httpClient, args.Operation, keyName, &args, &r, work.limiter, sysInterruptHandler, config.Debug)
-
-					if durationLimit.enabled() {
-						results <- r
-						return
-					}
-				}
+		for ctx.Err() == nil {
+			keyName, ok := nextKey()
+			if !ok {
+				break
 			}
 
-			// Keep sending requests until duration limit is reached.
-			if !durationLimit.applicable {
-				break
+			if args.Operation != "options" {
+				r.UniqObjNum++
+			}
+
+			for repcount := 0; repcount < args.attempts; repcount++ {
+				// Stop sending requests if the context has hit a deadline/timeout or been cancelled
+				if ctx.Err() != nil {
+					r.CancelledCount++
+					break OUTER
+				}
+				if source != nil {
+					if args.hasRandomSize() {
+						//size command line arg usually sets the size for each request we need to overwrite
+						// with new random size per request
+						newSize := randMinMax(source, args.min, args.max)
+						args.Size = byteSize(newSize)
+					} else if args.hasRandomRange() {
+						// range is inclusive
+						maxRangeStartIndex := args.randomRangeMax - args.randomRangeSize + 1
+						rangeStart := randMinMax(source, args.randomRangeMin, maxRangeStartIndex)
+						rangeEnd := rangeStart + args.randomRangeSize - 1
+						args.Range = fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
+						args.Size = byteSize(args.randomRangeSize)
+					}
+				}
+				sendRequest(ctx, svc, httpClient, args.Operation, keyName, &args, &r, work.limiter, sysInterruptHandler, config.Debug)
+
+				if durationLimit.enabled() {
+					r.markFinished(time.Now())
+					results <- r
+					return
+				}
 			}
 		}
 
 	}
 
+	r.markFinished(time.Now())
 	resultWG.Done()
 	results <- r
 }
@@ -509,6 +546,7 @@ func collectWorkerResult(c <-chan Result, args Parameters, startTime time.Time) 
 	testResult := processEndpointResults(endpointResultMap, args.endpoints)
 	testResult.correctResultsUniqObjCountWithOverwriteSetting(overwrite, workerWorkload, args.Requests)
 	testResult.CumulativeResult.Bucket = args.Bucket
+	testResult.CumulativeResult.startTime = startTime
 	testResult.CumulativeResult.elapsedTime = time.Since(startTime)
 	testResult.CumulativeResult.detailed = detailed
 	return testResult
@@ -533,6 +571,12 @@ func mergeResult(aggregateResults, r *Result) {
 	aggregateResults.Failcount += r.Failcount
 	aggregateResults.CancelledCount += r.CancelledCount
 	aggregateResults.elapsedSum += r.elapsedSum
+	if !r.firstFinish.IsZero() && (aggregateResults.firstFinish.IsZero() || r.firstFinish.Before(aggregateResults.firstFinish)) {
+		aggregateResults.firstFinish = r.firstFinish
+	}
+	if r.lastFinish.After(aggregateResults.lastFinish) {
+		aggregateResults.lastFinish = r.lastFinish
+	}
 }
 
 func (r *Result) correctEndpointUniqObjCountWithOverwriteSetting(overwrite int, workload int, args *Parameters) {
@@ -592,6 +636,9 @@ func processTestResult(testResult *results, args Parameters) {
 	cumulativeResult := &testResult.CumulativeResult
 	cumulativeResult.Operation = args.Operation
 	cumulativeResult.Concurrency = args.Concurrency
+	if args.KeyOrder == keyOrderRandom {
+		cumulativeResult.KeySeed = args.KeySeed
+	}
 	setupResultStat(cumulativeResult)
 
 	for _, endpointResult := range testResult.PerEndpointResult {
@@ -914,6 +961,9 @@ func printReadableResults(testResults []*results) {
 func printResult(results Result) {
 	fmt.Printf("Endpoint: %s\n", results.Endpoint)
 	fmt.Printf("Concurrency: %d\n", results.Concurrency)
+	if results.KeySeed != 0 {
+		fmt.Printf("Key seed: %d\n", results.KeySeed)
+	}
 	fmt.Printf("Total number of requests: %d\n", results.Count)
 
 	if results.UniqObjNum != 0 {
